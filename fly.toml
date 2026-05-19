@@ -1,7 +1,4 @@
-# fly.toml app configuration file generated for omniroute-t1ugsa on 2026-05-18T14:53:32Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
+# fly.toml app configuration file generated for omniroute-t1ugsa
 
 app = 'omniroute-t1ugsa'
 primary_region = 'sin'
@@ -27,7 +24,7 @@ primary_region = 'sin'
   auto_extend_size_limit = '10GB'
 
 [http_service]
-  internal_port = 8080
+  internal_port = 20128
   force_https = true
   auto_stop_machines = 'stop'
   auto_start_machines = true
