@@ -14,9 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: fly-io/setup-flyctl@v3
-        with:
-          version: latest
+      - name: Setup flyctl
+        uses: docker://flyio/setup-flyctl:latest
       - run: flyctl deploy --app omniroute-t1ugsa --region sin
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
