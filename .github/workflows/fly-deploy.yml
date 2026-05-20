@@ -16,6 +16,11 @@ jobs:
       - name: Install flyctl
         run: |
           curl -L https://fly.io/install.sh | sh
+      - name: Check app
+        run: |
+          $HOME/.fly/bin/flyctl apps list
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       - name: Deploy
         run: |
           $HOME/.fly/bin/flyctl deploy --app omniroute-t1ugsa --region sin --yes
