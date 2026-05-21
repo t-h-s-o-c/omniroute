@@ -1,13 +1,18 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useTranslations } from "next-intl";
 import { Card, Button, Select, Badge } from "@/shared/components";
 import { ALIAS_TO_ID } from "@/shared/constants/providers";
-import { pickMaskedDisplayValue } from "@/shared/utils/maskEmail";
+import { pickMaskedDisplayValue, pickDisplayValue } from "@/shared/utils/maskEmail";
+import useEmailPrivacyStore from "@/store/emailPrivacyStore";
 import dynamic from "next/dynamic";
+import Editor from "@/shared/components/MonacoEditor";
 
-const Editor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
 const SearchPlayground = dynamic(() => import("./SearchPlayground"), {
+  ssr: false,
+});
+const ChatPlayground = dynamic(() => import("./ChatPlayground"), {
   ssr: false,
 });
 
@@ -25,22 +30,12 @@ interface ProviderOption {
 interface ConnectionOption {
   id: string;
   name: string;
+  email?: string;
   provider: string;
   authType: string;
 }
 
-const ENDPOINT_OPTIONS = [
-  { value: "chat", label: "Chat Completions" },
-  { value: "responses", label: "Responses" },
-  { value: "images", label: "Image Generation" },
-  { value: "embeddings", label: "Embeddings" },
-  { value: "speech", label: "Text to Speech" },
-  { value: "transcription", label: "Audio Transcription" },
-  { value: "video", label: "Video Generation" },
-  { value: "music", label: "Music Generation" },
-  { value: "rerank", label: "Rerank" },
-  { value: "search", label: "Web Search" },
-];
+// Endpoint options will be generated dynamically with translations
 
 const DEFAULT_BODIES: Record<string, object> = {
   chat: {
@@ -152,13 +147,14 @@ async function fileToBase64(file: File): Promise<string> {
 
 /** Render image results from OpenAI-compatible format */
 function ImageResultsInline({ data }: { data: any }) {
+  const t = useTranslations("playground");
   const images: Array<{ url?: string; b64_json?: string; revised_prompt?: string }> =
     data?.data || [];
   if (images.length === 0) return null;
   return (
     <div className="p-4 space-y-3">
       <p className="text-xs text-text-muted font-medium uppercase tracking-wider">
-        {images.length} image{images.length > 1 ? "s" : ""} generated
+        {t("imagesGenerated", { count: images.length })}
       </p>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         {images.map((img, i) => {
@@ -169,7 +165,7 @@ function ImageResultsInline({ data }: { data: any }) {
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
                 src={src}
-                alt={img.revised_prompt || `Generated image ${i + 1}`}
+                alt={img.revised_prompt || t("generatedImage", { index: i + 1 })}
                 className="w-full"
               />
               <a
@@ -178,7 +174,7 @@ function ImageResultsInline({ data }: { data: any }) {
                 className="absolute bottom-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1"
               >
                 <span className="material-symbols-outlined text-[13px]">download</span>
-                Save
+                {t("save")}
               </a>
             </div>
           );
@@ -189,6 +185,26 @@ function ImageResultsInline({ data }: { data: any }) {
 }
 
 export default function PlaygroundPage() {
+  const t = useTranslations("playground");
+
+  // Get translated endpoint options
+  const endpointOptions = useMemo(
+    () => [
+      { value: "conversational", label: "Chat (Conversational)" },
+      { value: "chat", label: t("endpointOptions.chat") },
+      { value: "responses", label: t("endpointOptions.responses") },
+      { value: "images", label: t("endpointOptions.images") },
+      { value: "embeddings", label: t("endpointOptions.embeddings") },
+      { value: "speech", label: t("endpointOptions.speech") },
+      { value: "transcription", label: t("endpointOptions.transcription") },
+      { value: "video", label: t("endpointOptions.video") },
+      { value: "music", label: t("endpointOptions.music") },
+      { value: "rerank", label: t("endpointOptions.rerank") },
+      { value: "search", label: t("endpointOptions.search") },
+    ],
+    [t]
+  );
+
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [providers, setProviders] = useState<ProviderOption[]>([]);
   const [allConnections, setAllConnections] = useState<ConnectionOption[]>([]);
@@ -211,10 +227,19 @@ export default function PlaygroundPage() {
   const [uploadedImages, setUploadedImages] = useState<string[]>([]); // base64 URIs for vision
 
   const isSearchEndpoint = selectedEndpoint === "search";
+  const isConversationalEndpoint = selectedEndpoint === "conversational";
   const isTranscriptionEndpoint = selectedEndpoint === "transcription";
   const isChatEndpoint = selectedEndpoint === "chat";
   const isImageEndpoint = selectedEndpoint === "images";
   const supportsVision = isChatEndpoint && isVisionModel(selectedModel);
+
+  useEffect(() => {
+    return () => {
+      if (audioUrl) {
+        URL.revokeObjectURL(audioUrl);
+      }
+    };
+  }, [audioUrl]);
 
   // Load connections for a given provider — filtered from allConnections
   const providerConnections = allConnections.filter((c) => {
@@ -234,6 +259,7 @@ export default function PlaygroundPage() {
 
         const providerSet = new Set<string>();
         modelList.forEach((m) => {
+          if (typeof m?.id !== "string") return;
           const parts = m.id.split("/");
           if (parts.length >= 2) providerSet.add(parts[0]);
         });
@@ -245,7 +271,9 @@ export default function PlaygroundPage() {
           setSelectedProvider(providerOpts[0].value);
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        console.error("[playground] Failed to load models:", err);
+      });
 
     // Fetch ALL connections (once)
     fetch("/api/providers/client")
@@ -255,7 +283,8 @@ export default function PlaygroundPage() {
         for (const conn of data?.connections || []) {
           conns.push({
             id: conn.id,
-            name: pickMaskedDisplayValue([conn.name, conn.email], conn.id),
+            name: conn.name || conn.id,
+            email: conn.email,
             provider: conn.provider,
             authType: conn.authType || "apiKey",
           });
@@ -265,9 +294,18 @@ export default function PlaygroundPage() {
       .catch(() => {});
   }, []);
 
-  const filteredModels = models
-    .filter((m) => !selectedProvider || m.id.startsWith(selectedProvider + "/"))
-    .map((m) => ({ value: m.id, label: m.id }));
+  const filteredModels = (() => {
+    const seen = new Set<string>();
+    const out: Array<{ value: string; label: string }> = [];
+    for (const m of models) {
+      if (typeof m?.id !== "string") continue;
+      if (selectedProvider && !m.id.startsWith(selectedProvider + "/")) continue;
+      if (seen.has(m.id)) continue;
+      seen.add(m.id);
+      out.push({ value: m.id, label: m.id });
+    }
+    return out;
+  })();
 
   const generateDefaultBody = (endpoint: string, model: string) => {
     const template = { ...DEFAULT_BODIES[endpoint] };
@@ -281,7 +319,9 @@ export default function PlaygroundPage() {
     setSelectedProvider(newProvider);
     setSelectedConnection("");
     const providerModels = models
-      .filter((m) => !newProvider || m.id.startsWith(newProvider + "/"))
+      .filter(
+        (m) => typeof m?.id === "string" && (!newProvider || m.id.startsWith(newProvider + "/"))
+      )
       .map((m) => m.id);
     const firstModel = providerModels[0] || "";
     setSelectedModel(firstModel);
@@ -459,6 +499,8 @@ export default function PlaygroundPage() {
     }
   };
 
+  const emailsVisible = useEmailPrivacyStore((s) => s.emailsVisible);
+
   return (
     <div className="space-y-5">
       {/* Info Banner */}
@@ -467,11 +509,8 @@ export default function PlaygroundPage() {
           science
         </span>
         <div>
-          <p className="font-medium text-text-main mb-0.5">Model Playground</p>
-          <p>
-            Test any model directly from the dashboard. Pick a provider, model, and endpoint type,
-            then send a request to see the raw response.
-          </p>
+          <p className="font-medium text-text-main mb-0.5">{t("title")}</p>
+          <p>{t("description")}</p>
         </div>
       </div>
 
@@ -481,21 +520,21 @@ export default function PlaygroundPage() {
           {/* Endpoint — always first */}
           <div className="flex-1 w-full">
             <label className="block text-xs font-medium text-text-muted mb-1.5 uppercase tracking-wider">
-              Endpoint
+              {t("endpoint")}
             </label>
             <Select
               value={selectedEndpoint}
               onChange={(e: any) => handleEndpointChange(e.target.value)}
-              options={ENDPOINT_OPTIONS}
+              options={endpointOptions}
               className="w-full"
             />
           </div>
 
           {/* Provider — hidden in search mode */}
-          {!isSearchEndpoint && (
+          {!isSearchEndpoint && !isConversationalEndpoint && (
             <div className="flex-1 w-full">
               <label className="block text-xs font-medium text-text-muted mb-1.5 uppercase tracking-wider">
-                Provider
+                {t("provider")}
               </label>
               <Select
                 value={selectedProvider}
@@ -507,10 +546,10 @@ export default function PlaygroundPage() {
           )}
 
           {/* Model — hidden in search mode */}
-          {!isSearchEndpoint && (
+          {!isSearchEndpoint && !isConversationalEndpoint && (
             <div className="flex-1 w-full">
               <label className="block text-xs font-medium text-text-muted mb-1.5 uppercase tracking-wider">
-                Model
+                {t("model")}
               </label>
               <Select
                 value={selectedModel}
@@ -522,10 +561,10 @@ export default function PlaygroundPage() {
           )}
 
           {/* Account/Key — always shown when provider is selected */}
-          {!isSearchEndpoint && (
+          {!isSearchEndpoint && !isConversationalEndpoint && (
             <div className="flex-1 w-full">
               <label className="block text-xs font-medium text-text-muted mb-1.5 uppercase tracking-wider">
-                Account / Key
+                {t("accountKey")}
               </label>
               <Select
                 value={selectedConnection}
@@ -535,12 +574,12 @@ export default function PlaygroundPage() {
                     value: "",
                     label:
                       providerConnections.length > 0
-                        ? `Auto (${providerConnections.length} accounts)`
-                        : "No accounts",
+                        ? t("autoAccounts", { count: providerConnections.length })
+                        : t("noAccounts"),
                   },
                   ...providerConnections.map((c) => ({
                     value: c.id,
-                    label: c.name,
+                    label: pickDisplayValue([c.name, c.email], emailsVisible, c.id),
                   })),
                 ]}
                 className="w-full"
@@ -549,11 +588,11 @@ export default function PlaygroundPage() {
           )}
 
           {/* Send Button — hidden in search mode (SearchPlayground has its own) */}
-          {!isSearchEndpoint && (
+          {!isSearchEndpoint && !isConversationalEndpoint && (
             <div className="shrink-0">
               {loading ? (
                 <Button icon="stop" variant="secondary" onClick={handleCancel}>
-                  Cancel
+                  {t("cancel")}
                 </Button>
               ) : (
                 <Button
@@ -564,7 +603,7 @@ export default function PlaygroundPage() {
                     (!selectedModel && !isTranscriptionEndpoint)
                   }
                 >
-                  Send
+                  {t("send")}
                 </Button>
               )}
             </div>
@@ -572,9 +611,27 @@ export default function PlaygroundPage() {
         </div>
       </Card>
 
-      {/* Search mode — isolated sub-component */}
+      {/* Isolated sub-components */}
       {isSearchEndpoint ? (
         <SearchPlayground />
+      ) : isConversationalEndpoint ? (
+        <ChatPlayground
+          selectedProvider={selectedProvider}
+          selectedModel={selectedModel}
+          selectedConnection={selectedConnection}
+          models={models}
+          providers={providers}
+          providerConnections={providerConnections}
+          onProviderChange={handleProviderChange}
+          onModelChange={handleModelChange}
+          onConnectionChange={setSelectedConnection}
+          noAccountsString={t("noAccounts")}
+          autoAccountsString={
+            providerConnections.length > 0
+              ? t("autoAccounts", { count: providerConnections.length })
+              : ""
+          }
+        />
       ) : (
         <>
           {/* File Upload Zone — shown for transcription and vision models */}
@@ -586,16 +643,16 @@ export default function PlaygroundPage() {
                     attach_file
                   </span>
                   <h3 className="text-sm font-semibold text-text-main">
-                    {isTranscriptionEndpoint ? "Audio File" : "Attach Images (Vision)"}
+                    {isTranscriptionEndpoint ? t("audioFile") : t("attachImages")}
                   </h3>
                   {isTranscriptionEndpoint && (
                     <Badge variant="info" size="sm">
-                      multipart/form-data
+                      {t("multipartFormData")}
                     </Badge>
                   )}
                   {supportsVision && (
                     <Badge variant="info" size="sm">
-                      up to 4 images
+                      {t("upToImages")}
                     </Badge>
                   )}
                 </div>
@@ -618,7 +675,7 @@ export default function PlaygroundPage() {
                     {!uploadedFile && (
                       <p className="text-xs text-amber-500 mt-1 flex items-center gap-1">
                         <span className="material-symbols-outlined text-[12px]">info</span>
-                        Select an audio file to transcribe (mp3, wav, m4a, ogg, flac…)
+                        {t("selectAudioFile")}
                       </p>
                     )}
                   </div>
@@ -659,7 +716,7 @@ export default function PlaygroundPage() {
                           onClick={() => setUploadedImages([])}
                           className="text-xs text-text-muted hover:text-red-500 self-center ml-1"
                         >
-                          Clear all
+                          {t("clearAll")}
                         </button>
                       </div>
                     )}
@@ -679,7 +736,7 @@ export default function PlaygroundPage() {
                     <span className="material-symbols-outlined text-[18px] text-text-muted">
                       upload
                     </span>
-                    <h3 className="text-sm font-semibold text-text-main">Request</h3>
+                    <h3 className="text-sm font-semibold text-text-main">{t("request")}</h3>
                     <Badge variant="info" size="sm">
                       POST {ENDPOINT_PATHS[selectedEndpoint]}
                     </Badge>
@@ -688,7 +745,7 @@ export default function PlaygroundPage() {
                     <button
                       onClick={() => handleCopy(requestBody)}
                       className="p-1.5 rounded hover:bg-black/5 dark:hover:bg-white/5 text-text-muted hover:text-text-main transition-colors"
-                      title="Copy"
+                      title={t("copy")}
                     >
                       <span className="material-symbols-outlined text-[16px]">content_copy</span>
                     </button>
@@ -699,7 +756,7 @@ export default function PlaygroundPage() {
                         setRequestBody(JSON.stringify(template, null, 2));
                       }}
                       className="p-1.5 rounded hover:bg-black/5 dark:hover:bg-white/5 text-text-muted hover:text-text-main transition-colors"
-                      title="Reset to default"
+                      title={t("resetToDefault")}
                     >
                       <span className="material-symbols-outlined text-[16px]">restart_alt</span>
                     </button>
@@ -710,8 +767,7 @@ export default function PlaygroundPage() {
                     <span className="material-symbols-outlined text-[12px] text-amber-500 mt-0.5">
                       info
                     </span>
-                    Transcription uses multipart/form-data. Upload the audio file above — JSON below
-                    controls extra params (model, language).
+                    {t("transcriptionHint")}
                   </p>
                 )}
                 <div className="border border-border rounded-lg overflow-hidden">
@@ -743,7 +799,7 @@ export default function PlaygroundPage() {
                     <span className="material-symbols-outlined text-[18px] text-text-muted">
                       download
                     </span>
-                    <h3 className="text-sm font-semibold text-text-main">Response</h3>
+                    <h3 className="text-sm font-semibold text-text-main">{t("response")}</h3>
                     {responseStatus !== null && (
                       <Badge
                         variant={
@@ -767,7 +823,7 @@ export default function PlaygroundPage() {
                     <button
                       onClick={() => handleCopy(responseBody)}
                       className="p-1.5 rounded hover:bg-black/5 dark:hover:bg-white/5 text-text-muted hover:text-text-main transition-colors"
-                      title="Copy"
+                      title={t("copy")}
                     >
                       <span className="material-symbols-outlined text-[16px]">content_copy</span>
                     </button>
@@ -783,7 +839,7 @@ export default function PlaygroundPage() {
                         className="inline-flex items-center gap-2 text-sm text-primary hover:underline"
                       >
                         <span className="material-symbols-outlined text-[16px]">download</span>
-                        Download audio
+                        {t("downloadAudio")}
                       </a>
                     </div>
                   ) : imageData ? (
@@ -791,7 +847,7 @@ export default function PlaygroundPage() {
                   ) : transcriptionText !== null ? (
                     <div className="p-4 space-y-2">
                       <p className="text-xs text-text-muted font-medium uppercase tracking-wider">
-                        Transcription
+                        {t("transcription")}
                       </p>
                       <div className="bg-surface/50 rounded p-3 text-sm text-text-main leading-relaxed whitespace-pre-wrap">
                         {transcriptionText}
@@ -801,7 +857,7 @@ export default function PlaygroundPage() {
                         className="text-xs text-primary hover:underline flex items-center gap-1"
                       >
                         <span className="material-symbols-outlined text-[12px]">content_copy</span>
-                        Copy text
+                        {t("copyText")}
                       </button>
                     </div>
                   ) : (

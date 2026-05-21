@@ -1,6 +1,87 @@
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
-import { storeGeminiThoughtSignature } from "../../services/geminiThoughtSignatureStore.ts";
+import {
+  buildGeminiThoughtSignatureKey,
+  storeGeminiThoughtSignature,
+} from "../../services/geminiThoughtSignatureStore.ts";
+
+type GeminiToOpenAIState = {
+  functionIndex: number;
+  messageId: string;
+  model: string;
+  pendingThoughtSignature?: string | null;
+  signatureNamespace?: string | null;
+  toolCalls: Map<number, unknown>;
+  toolNameMap?: Map<string, string>;
+};
+
+type GeminiFunctionCallPart = {
+  functionCall: {
+    args?: unknown;
+    id?: string;
+    name: string;
+  };
+};
+
+function buildToolCallId(
+  functionCall: GeminiFunctionCallPart["functionCall"],
+  toolName: string,
+  toolCallIndex: number
+) {
+  return typeof functionCall?.id === "string" && functionCall.id.length > 0
+    ? functionCall.id
+    : `${toolName}-${Date.now()}-${toolCallIndex}`;
+}
+
+function getSignatureCacheKey(
+  state: Pick<GeminiToOpenAIState, "signatureNamespace">,
+  toolCallId: unknown
+) {
+  return buildGeminiThoughtSignatureKey(state?.signatureNamespace, toolCallId);
+}
+
+function emitFunctionCallPart(
+  part: GeminiFunctionCallPart,
+  state: GeminiToOpenAIState,
+  results: Array<Record<string, unknown>>
+) {
+  const rawToolName = part.functionCall.name;
+  const fcName = state.toolNameMap?.get(rawToolName) || rawToolName;
+  const fcArgs = part.functionCall.args || {};
+  const toolCallIndex = state.functionIndex++;
+  const toolCall = {
+    id: buildToolCallId(part.functionCall, fcName, toolCallIndex),
+    index: toolCallIndex,
+    type: "function",
+    function: {
+      name: fcName,
+      arguments: JSON.stringify(fcArgs),
+    },
+  };
+
+  if (state.pendingThoughtSignature) {
+    storeGeminiThoughtSignature(
+      getSignatureCacheKey(state, toolCall.id),
+      state.pendingThoughtSignature
+    );
+    state.pendingThoughtSignature = null;
+  }
+
+  state.toolCalls.set(toolCallIndex, toolCall);
+  results.push({
+    id: `chatcmpl-${state.messageId}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: state.model,
+    choices: [
+      {
+        index: 0,
+        delta: { tool_calls: [toolCall] },
+        finish_reason: null,
+      },
+    ],
+  });
+}
 
 // Convert Gemini response chunk to OpenAI format
 export function geminiToOpenAIResponse(chunk, state) {
@@ -28,7 +109,7 @@ export function geminiToOpenAIResponse(chunk, state) {
         choices: [
           {
             index: 0,
-            delta: { role: "assistant" },
+            delta: { role: "assistant", content: "" },
             finish_reason: null,
           },
         ],
@@ -83,8 +164,8 @@ export function geminiToOpenAIResponse(chunk, state) {
         state.pendingThoughtSignature = hasThoughtSig;
       }
 
-      // Handle thought signature (thinking mode)
-      if (hasThoughtSig) {
+      // Handle thought signature (thinking mode) or native gemini thought flag
+      if (hasThoughtSig || isThought) {
         const hasTextContent = part.text !== undefined && part.text !== "";
         const hasFunctionCall = !!part.functionCall;
 
@@ -105,40 +186,7 @@ export function geminiToOpenAIResponse(chunk, state) {
         }
 
         if (hasFunctionCall) {
-          const fcName = part.functionCall.name;
-          const fcArgs = part.functionCall.args || {};
-          const toolCallIndex = state.functionIndex++;
-
-          const toolCall = {
-            id: `${fcName}-${Date.now()}-${toolCallIndex}`,
-            index: toolCallIndex,
-            type: "function",
-            function: {
-              name: fcName,
-              arguments: JSON.stringify(fcArgs),
-            },
-          };
-
-          if (state.pendingThoughtSignature) {
-            storeGeminiThoughtSignature(toolCall.id, state.pendingThoughtSignature);
-            state.pendingThoughtSignature = null;
-          }
-
-          state.toolCalls.set(toolCallIndex, toolCall);
-
-          results.push({
-            id: `chatcmpl-${state.messageId}`,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: state.model,
-            choices: [
-              {
-                index: 0,
-                delta: { tool_calls: [toolCall] },
-                finish_reason: null,
-              },
-            ],
-          });
+          emitFunctionCallPart(part, state, results);
         }
         continue;
       }
@@ -162,40 +210,7 @@ export function geminiToOpenAIResponse(chunk, state) {
 
       // Function call
       if (part.functionCall) {
-        const fcName = part.functionCall.name;
-        const fcArgs = part.functionCall.args || {};
-        const toolCallIndex = state.functionIndex++;
-
-        const toolCall = {
-          id: `${fcName}-${Date.now()}-${toolCallIndex}`,
-          index: toolCallIndex,
-          type: "function",
-          function: {
-            name: fcName,
-            arguments: JSON.stringify(fcArgs),
-          },
-        };
-
-        if (state.pendingThoughtSignature) {
-          storeGeminiThoughtSignature(toolCall.id, state.pendingThoughtSignature);
-          state.pendingThoughtSignature = null;
-        }
-
-        state.toolCalls.set(toolCallIndex, toolCall);
-
-        results.push({
-          id: `chatcmpl-${state.messageId}`,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model: state.model,
-          choices: [
-            {
-              index: 0,
-              delta: { tool_calls: [toolCall] },
-              finish_reason: null,
-            },
-          ],
-        });
+        emitFunctionCallPart(part, state, results);
       }
 
       // Inline data (images)

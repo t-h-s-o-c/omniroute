@@ -16,8 +16,19 @@
  * Registration: call registerCodexQuotaFetcher() once at server startup.
  */
 
-import { registerQuotaFetcher, type QuotaInfo } from "./quotaPreflight.ts";
+import { registerQuotaFetcher, registerQuotaWindows, type QuotaInfo } from "./quotaPreflight.ts";
 import { registerMonitorFetcher } from "./quotaMonitor.ts";
+
+/**
+ * Stable identifiers for Codex's quota windows. These match the quota keys
+ * surfaced by `getCodexUsage` (in usage.ts) and rendered by the dashboard,
+ * so per-window thresholds set in the UI line up with the keys persisted
+ * in `provider_connections.quota_window_thresholds_json`. The dedicated
+ * Codex fetcher exposes only session + weekly today; the plan-dependent
+ * code_review window is surfaced by the generic path when present.
+ */
+export const CODEX_WINDOW_SESSION = "session"; // primary 5-hour window
+export const CODEX_WINDOW_WEEKLY = "weekly"; //  secondary 7-day window
 
 // Codex usage endpoint (same as usage.ts CODEX_CONFIG)
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
@@ -76,6 +87,50 @@ export function registerCodexConnection(connectionId: string, meta: CodexConnect
   connectionRegistry.set(connectionId, meta);
 }
 
+function getCodexConnectionMeta(
+  connectionId: string,
+  connection?: Record<string, unknown>
+): CodexConnectionMeta | null {
+  if (connection && typeof connection === "object") {
+    const providerSpecificData =
+      connection.providerSpecificData &&
+      typeof connection.providerSpecificData === "object" &&
+      !Array.isArray(connection.providerSpecificData)
+        ? (connection.providerSpecificData as Record<string, unknown>)
+        : {};
+    const accessToken =
+      typeof connection.accessToken === "string" && connection.accessToken.trim().length > 0
+        ? connection.accessToken
+        : null;
+    const workspaceId =
+      typeof providerSpecificData.workspaceId === "string" &&
+      providerSpecificData.workspaceId.trim().length > 0
+        ? providerSpecificData.workspaceId
+        : undefined;
+
+    if (accessToken) {
+      const meta = { accessToken, ...(workspaceId ? { workspaceId } : {}) };
+      connectionRegistry.set(connectionId, meta);
+      return meta;
+    }
+  }
+
+  return connectionRegistry.get(connectionId) || null;
+}
+
+function getDominantResetAt(quota: {
+  window5h: { percentUsed: number; resetAt: string | null };
+  window7d: { percentUsed: number; resetAt: string | null };
+}): string | null {
+  if (quota.window7d.percentUsed > quota.window5h.percentUsed) {
+    return quota.window7d.resetAt || quota.window5h.resetAt;
+  }
+  if (quota.window5h.percentUsed > quota.window7d.percentUsed) {
+    return quota.window5h.resetAt || quota.window7d.resetAt;
+  }
+  return quota.window7d.resetAt || quota.window5h.resetAt;
+}
+
 // ─── Core Fetcher ────────────────────────────────────────────────────────────
 
 /**
@@ -85,7 +140,10 @@ export function registerCodexConnection(connectionId: string, meta: CodexConnect
  * @param connectionId - Connection ID from the DB (used to look up credentials)
  * @returns QuotaInfo or null if fetch fails / no credentials
  */
-export async function fetchCodexQuota(connectionId: string): Promise<QuotaInfo | null> {
+export async function fetchCodexQuota(
+  connectionId: string,
+  connection?: Record<string, unknown>
+): Promise<QuotaInfo | null> {
   // Check cache first
   const cached = quotaCache.get(connectionId);
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
@@ -93,7 +151,7 @@ export async function fetchCodexQuota(connectionId: string): Promise<QuotaInfo |
   }
 
   // Look up credentials
-  const meta = connectionRegistry.get(connectionId);
+  const meta = getCodexConnectionMeta(connectionId, connection);
   if (!meta?.accessToken) {
     // No credentials registered — skip preflight gracefully
     return null;
@@ -202,12 +260,26 @@ function parseCodexUsageResponse(data: unknown): CodexDualWindowQuota | null {
 
   const limitReached = Boolean(rateLimit["limit_reached"] ?? rateLimit["limitReached"]);
 
+  const window5h = { percentUsed: usedPercent5h / 100, resetAt: resetAt5h };
+  const window7d = { percentUsed: usedPercent7d / 100, resetAt: resetAt7d };
+
   return {
     used: worstPercentUsed,
     total: 100,
     percentUsed: percentUsedNormalized,
-    window5h: { percentUsed: usedPercent5h / 100, resetAt: resetAt5h },
-    window7d: { percentUsed: usedPercent7d / 100, resetAt: resetAt7d },
+    resetAt: getDominantResetAt({ window5h, window7d }),
+    // Per-window breakdown for the preflight evaluator. Keys match what the
+    // dashboard renders (session = 5h, weekly = 7d) so user-set cutoffs and
+    // displayed quotas refer to the same windows.
+    windows: {
+      ...(hasPrimary ? { [CODEX_WINDOW_SESSION]: window5h } : {}),
+      ...(hasSecondary ? { [CODEX_WINDOW_WEEKLY]: window7d } : {}),
+    },
+    // Legacy fields preserved for existing consumers (quotaMonitor, cooldown
+    // computation in accountFallback). These mirror the new windows entries
+    // but keep the historical names — do not remove without checking callers.
+    window5h,
+    window7d,
     limitReached,
   };
 }
@@ -263,4 +335,5 @@ export function invalidateCodexQuotaCache(connectionId: string): void {
 export function registerCodexQuotaFetcher(): void {
   registerQuotaFetcher("codex", fetchCodexQuota);
   registerMonitorFetcher("codex", fetchCodexQuota);
+  registerQuotaWindows("codex", [CODEX_WINDOW_SESSION, CODEX_WINDOW_WEEKLY]);
 }

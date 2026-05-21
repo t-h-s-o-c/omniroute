@@ -3,18 +3,19 @@
 ## Project
 
 Unified AI proxy/router — route any LLM through one endpoint. Multi-provider support
-with **60+ providers** (OpenAI, Anthropic, Gemini, DeepSeek, Groq, xAI, Mistral, Fireworks,
-Cohere, NVIDIA, Cerebras, Pollinations, Puter, Cloudflare AI, HuggingFace, and many more)
-with **MCP Server** (25 tools), **A2A v0.3 Protocol**, and **Electron desktop app**.
+with **160+ providers** (OpenAI, Anthropic, Gemini, DeepSeek, Groq, xAI, Mistral, Fireworks,
+Cohere, NVIDIA, Cerebras, Pollinations, Puter, Cloudflare AI, HuggingFace, DeepInfra,
+SambaNova, Meta Llama API, Moonshot AI, AI21 Labs, Databricks, Snowflake, and many more)
+with **MCP Server** (37 tools), **A2A v0.3 Protocol**, and **Electron desktop app**.
 
 ## Stack
 
-- **Runtime**: Next.js 16 (App Router), Node.js ≥18 <24, ES Modules (`"type": "module"`)
+- **Runtime**: Next.js 16 (App Router), Node.js `>=20.20.2 <21`, `>=22.22.2 <23`, or `>=24.0.0 <25`, ES Modules (`"type": "module"`)
 - **Language**: TypeScript 5.9 (`src/`) + JavaScript (`open-sse/`, `electron/`)
 - **Database**: better-sqlite3 (SQLite) — `DATA_DIR` configurable, default `~/.omniroute/`
 - **Streaming**: SSE via `open-sse` internal workspace package
 - **Styling**: Tailwind CSS v4
-- **i18n**: next-intl with 30 languages
+- **i18n**: next-intl with 40+ languages
 - **Desktop**: Electron (cross-platform: Windows, macOS, Linux)
 - **Schemas**: Zod v4 for all API / MCP input validation
 
@@ -43,13 +44,13 @@ with **MCP Server** (25 tools), **A2A v0.3 Protocol**, and **Electron desktop ap
 npm run test:all
 
 # Single test file (Node.js native test runner — most tests use this)
-node --import tsx/esm --test tests/unit/your-file.test.mjs
-node --import tsx/esm --test tests/unit/plan3-p0.test.mjs
-node --import tsx/esm --test tests/unit/fixes-p1.test.mjs
-node --import tsx/esm --test tests/unit/security-fase01.test.mjs
+node --import tsx/esm --test tests/unit/your-file.test.ts
+node --import tsx/esm --test tests/unit/plan3-p0.test.ts
+node --import tsx/esm --test tests/unit/fixes-p1.test.ts
+node --import tsx/esm --test tests/unit/security-fase01.test.ts
 
 # Integration tests
-node --import tsx/esm --test tests/integration/*.test.mjs
+node --import tsx/esm --test tests/integration/*.test.ts
 
 # Vitest (MCP server, autoCombo)
 npm run test:vitest
@@ -63,16 +64,11 @@ npm run test:protocols:e2e
 # Ecosystem compatibility tests
 npm run test:ecosystem
 
-# Coverage (60% minimum for statements, lines, functions, and branches)
+# Coverage (see CONTRIBUTING.md)
 npm run test:coverage
 ```
 
-### PR Coverage Policy
-
-- `npm run test:coverage` is the PR coverage gate in CI.
-- The repository minimum is **60%** for statements, lines, functions, and branches.
-- If a PR changes production code in `src/`, `open-sse/`, `electron/`, or `bin/`, it must include or update automated tests in the same PR.
-- For agent-driven review or coding flows: if coverage is below the gate or source changes ship without tests, do not stop at reporting. Add or update tests first, rerun the gate, and only then ask for confirmation.
+**For authoritative coverage requirements, test execution, and PR gates, see [`CONTRIBUTING.md`](CONTRIBUTING.md#running-tests).**
 
 ---
 
@@ -124,6 +120,10 @@ Always run `prettier --write` on changed files.
 - Auth middleware required on all API routes
 - Never log SQLite encryption keys
 - Sanitize user content (dompurify for HTML)
+- **Public upstream OAuth identifiers** (Gemini / Antigravity / Windsurf-style client_id/secret + Firebase Web keys extracted from public CLIs): use `resolvePublicCred()` from `open-sse/utils/publicCreds.ts`, **never** as string literals. Full pattern in `docs/security/PUBLIC_CREDS.md`.
+- **Error responses** (HTTP / SSE / executor / MCP): use `buildErrorBody()` or `sanitizeErrorMessage()` from `open-sse/utils/error.ts`, **never** put raw `err.stack` / `err.message` in a Response body. Full pattern in `docs/security/ERROR_SANITIZATION.md`.
+- **`exec()` / `spawn()` with runtime values**: pass via the `env` option, **never** string-interpolate paths/values into the script body. Reference: `src/mitm/cert/install.ts::updateNssDatabases`.
+- Prefer secure-by-default libraries when available — see [tldrsec/awesome-secure-defaults](https://github.com/tldrsec/awesome-secure-defaults) for the curated list (Helmet.js, DOMPurify, ssrf-req-filter, safe-regex, Google Tink, etc.).
 
 ---
 
@@ -131,18 +131,83 @@ Always run `prettier --write` on changed files.
 
 ### Data Layer (`src/lib/db/`)
 
-All persistence uses SQLite through domain-specific modules:
-`core.ts`, `providers.ts`, `models.ts`, `combos.ts`, `apiKeys.ts`, `settings.ts`,
-`backup.ts`, `proxies.ts`, `prompts.ts`, `webhooks.ts`, `detailedLogs.ts`,
-`domainState.ts`, `registeredKeys.ts`, `quotaSnapshots.ts`, `modelComboMappings.ts`,
-`cliToolState.ts`, `encryption.ts`, `readCache.ts`, `secrets.ts`, `stateReset.ts`,
-`contextHandoffs.ts`.
-Schema migrations live in `db/migrations/` and run via `migrationRunner.ts`.
+All persistence uses SQLite through **45+ domain-specific modules** in `src/lib/db/`. Top modules:
+
+- Core: `core.ts`, `migrationRunner.ts`, `encryption.ts`, `stateReset.ts`
+- Providers / catalog: `providers.ts`, `models.ts`, `providerLimits.ts`, `compressionAnalytics.ts`
+- Routing: `combos.ts`, `modelComboMappings.ts`, `domainState.ts`, `commandCodeAuth.ts`
+- Auth: `apiKeys.ts`, `secrets.ts`, `registeredKeys.ts`, `sessionAccountAffinity.ts`
+- Usage / billing: `quotaSnapshots.ts`, `creditBalance.ts`, `usage*.ts`, `compressionCacheStats.ts`
+- Storage: `backup.ts`, `cleanup.ts`, `jsonMigration.ts`, `healthCheck.ts`, `databaseSettings.ts`
+- Extension modules: `evals.ts`, `webhooks.ts`, `reasoningCache.ts`, `readCache.ts`, `tierConfig.ts`, `compressionCombos.ts`, `compressionScheduler.ts`, `batches.ts`, `files.ts`, `syncTokens.ts`, `proxies.ts`, `oneproxy.ts`, `upstreamProxy.ts`, `versionManager.ts`, `cliToolState.ts`, `prompts.ts`, `detailedLogs.ts`, `contextHandoffs.ts`, `compression.ts`, `stats.ts`
+
+Live count: `ls src/lib/db/*.ts | wc -l` (currently 45).
+Schema migrations live in `db/migrations/` (55 files) and run via `migrationRunner.ts`.
 `src/lib/localDb.ts` is a **re-export layer only** — never add logic there.
+
+#### DB Internals
+
+- **`core.ts`**: `getDbInstance()` returns a singleton `better-sqlite3` instance with WAL
+  journaling. `SCHEMA_SQL` defines 15 base tables. Helpers: `rowToCamel`, `encryptConnectionFields`.
+- **`migrationRunner.ts`**: Applies versioned SQL files from `db/migrations/` inside transactions.
+  Tracks applied migrations in `_omniroute_migrations` table.
+- **Migrations**: 55 files (`001_initial_schema.sql` → `055_command_code_auth_sessions.sql`).
+  Each migration is idempotent and runs in a transaction. Live count: `ls src/lib/db/migrations/*.sql | wc -l`.
+- **Domain modules** import `getDbInstance()` from `core.ts` for all CRUD operations.
+  Each module owns a specific table/set of tables (e.g., `providers.ts` → `provider_connections`,
+  `combos.ts` → `combos`). Encryption helpers protect sensitive fields at rest.
+- **`localDb.ts`** re-exports all domain modules — consumers import from here for convenience.
+
+### API Route Layer (`src/app/api/v1/`)
+
+Next.js App Router routes — each follows a consistent pattern:
+
+```
+Route → CORS preflight → Body validation (Zod) → Optional auth (extractApiKey/isValidApiKey)
+  → API key policy enforcement (enforceApiKeyPolicy) → Handler delegation (open-sse)
+```
+
+| Route                           | Handler                   | Notes                                     |
+| ------------------------------- | ------------------------- | ----------------------------------------- |
+| `chat/completions/route.ts`     | `handleChat()`            | + prompt injection guard (clones request) |
+| `responses/route.ts`            | `handleChat()` (unified)  | Responses API format                      |
+| `embeddings/route.ts`           | `handleEmbedding()`       | Model listing + creation                  |
+| `images/generations/route.ts`   | `handleImageGeneration()` | Model listing + creation                  |
+| `audio/transcriptions/route.ts` | audio handler             | Multipart form data                       |
+| `audio/speech/route.ts`         | TTS handler               | Binary audio response                     |
+| `videos/generations/route.ts`   | video handler             | ComfyUI/SD WebUI                          |
+| `music/generations/route.ts`    | music handler             | ComfyUI workflows                         |
+| `moderations/route.ts`          | moderation handler        | Content safety                            |
+| `rerank/route.ts`               | rerank handler            | Document relevance                        |
+| `search/route.ts`               | search handler            | Web search (5 providers)                  |
+
+**No global Next.js middleware file** — interception is route-specific. Auth is optional
+(controlled by `REQUIRE_API_KEY` env). Prompt injection guard is unique to chat completions.
 
 ### Request Pipeline (`open-sse/`)
 
-`chatCore.ts` → executor → upstream provider. Translations in `open-sse/translator/`.
+The `open-sse/` workspace is the core streaming engine. Full request flow:
+
+```
+Client Request
+  → src/app/api/v1/.../route.ts (Next.js route)
+    → open-sse/handlers/chatCore.ts::handleChatCore()
+      → Semantic/signature cache check
+      → Rate limit check (rateLimitManager)
+      → Combo routing? → open-sse/services/combo.ts::handleComboChat()
+        → resolveComboTargets() → ordered ResolvedComboTarget[]
+        → For each target: handleSingleModel() (wraps chatCore)
+      → translateRequest() (open-sse/translator/)
+        → Convert source format (e.g., OpenAI) → target format (e.g., Claude)
+      → getExecutor() → provider-specific executor instance
+        → executor.execute() (BaseExecutor → DefaultExecutor or provider-specific)
+          → buildUrl() + buildHeaders() + transformRequest()
+          → fetch() to upstream provider
+          → Retry logic with exponential backoff
+      → Response translation back to client format
+      → If Responses API: responsesTransformer.ts TransformStream
+  → SSE stream or JSON response to client
+```
 
 **Handlers** (`open-sse/handlers/`): `chatCore.ts`, `responsesHandler.ts`, `embeddings.ts`,
 `imageGeneration.ts`, `videoGeneration.ts`, `musicGeneration.ts`, `audioSpeech.ts`,
@@ -156,14 +221,22 @@ Zod schemas, and unit tests aligned when editing.
 ### Provider Categories
 
 - **Free** (4): Qoder AI, Qwen Code, Gemini CLI (deprecated), Kiro AI
-- **OAuth** (8): Claude Code, Antigravity, Codex, GitHub Copilot, Cursor, Kimi Coding, Kilo Code, Cline
-- **API Key** (48+): OpenAI, Anthropic, Gemini, DeepSeek, Groq, xAI, Mistral, Perplexity,
+- **OAuth** (14): Claude Code, Antigravity, Codex, GitHub Copilot, Cursor, Kimi Coding, Kilo Code, Cline, Qwen (⚠️ free tier discontinued 2026-04-15), Kiro, Qoder, Gemini, Windsurf (v3.8), GitLab Duo (v3.8)
+- **API Key** (120+): OpenAI, Anthropic, Gemini, DeepSeek, Groq, xAI, Mistral, Perplexity,
   Together, Fireworks, Cerebras, Cohere, NVIDIA, Nebius, SiliconFlow, Hyperbolic,
   HuggingFace, OpenRouter, Vertex AI, Cloudflare AI, Scaleway, AI/ML API, Pollinations,
   Puter, Longcat, Alibaba, Kimi, Minimax, Blackbox, Synthetic, Kilo Gateway,
   Z.AI, GLM, Deepgram, AssemblyAI, ElevenLabs, Cartesia, PlayHT, Inworld,
   NanoBanana, SD WebUI, ComfyUI, Ollama Cloud, Perplexity Search, Serper, Brave, Exa,
-  Tavily, OpenCode Zen/Go, Bailian Coding Plan, and more.
+  Tavily, OpenCode Zen/Go, Bailian Coding Plan, DeepInfra, Vercel AI Gateway,
+  Lambda AI, SambaNova, nScale, OVHcloud AI, Baseten, PublicAI, Moonshot AI,
+  Meta Llama API, v0 (Vercel), Morph, Featherless AI, FriendliAI, LlamaGate,
+  Galadriel, Weights & Biases Inference, Volcengine, AI21 Labs, Venice.ai,
+  Codestral, Upstage, Maritalk, Xiaomi MiMo, Inference.net, NanoGPT, Predibase,
+  Bytez, Heroku AI, Databricks, Snowflake Cortex, GigaChat (Sber), CrofAI,
+  AgentRouter, ChatGPT Web, Baidu Qianfan, AWS Polly, RunwayML, GitLab Duo,
+  Amazon Q, Empower, Poe, and many more.
+- **Self-Hosted** (8+): LM Studio, vLLM, Lemonade, Llamafile, Triton, Docker Model Runner, Xinference, Oobabooga
 - **Custom**: OpenAI-compatible (`openai-compatible-*`) and Anthropic-compatible (`anthropic-compatible-*`) prefixes
 
 Providers are registered in `src/shared/constants/providers.ts` with Zod validation at module load.
@@ -174,14 +247,45 @@ Provider-specific request executors: `base.ts`, `default.ts`, `cursor.ts`, `code
 `antigravity.ts`, `github.ts`, `gemini-cli.ts`, `kiro.ts`, `qoder.ts`, `vertex.ts`,
 `cloudflare-ai.ts`, `opencode.ts`, `pollinations.ts`, `puter.ts`.
 
+#### Executor Internals
+
+- **`base.ts`** (`BaseExecutor`): Abstract base with `buildUrl()`, `buildHeaders()`,
+  `transformRequest()`, retry logic (exponential backoff), and `execute()`. Subclasses
+  override URL/header/transform methods for provider-specific behavior.
+- **`default.ts`** (`DefaultExecutor extends BaseExecutor`): Handles most OpenAI-compatible
+  providers. Reads provider config from `providerRegistry.ts` to resolve base URL, auth
+  header format, and request transformations.
+- **`getExecutor()`** (`executors/index.ts`): Factory that returns the correct executor
+  instance based on provider ID. Provider-specific executors (Cursor, Codex, Vertex, etc.)
+  override only what differs from the default.
+
 ### Translator (`open-sse/translator/`)
 
 Translates between API formats (OpenAI-format ↔ Anthropic, Gemini, etc.).
 Includes request/response translators with helpers for image handling.
 
+#### Translator Internals
+
+- **`translator/index.ts`**: Exports `translateRequest()` and format constants. Called by
+  `chatCore.ts` before executor dispatch.
+- **Flow**: `translateRequest(body, sourceFormat, targetFormat)` → detects source format
+  (OpenAI, Anthropic, Gemini) → applies the matching translator module → returns
+  transformed body ready for the target provider.
+- **Response translation** runs in reverse after upstream response, converting back to
+  the client's expected format.
+
 ### Transformer (`open-sse/transformer/`)
 
 `responsesTransformer.ts` — transforms Responses API format to/from Chat Completions format.
+
+#### Transformer Internals
+
+- **`createResponsesApiTransformStream()`**: Returns a `TransformStream` that converts
+  Chat Completions SSE chunks (`data: {"choices":[...]}`) into Responses API SSE events
+  (`response.output_item.added`, `response.output_text.delta`, etc.).
+- Used when the client sends a Responses API request: the request is internally converted
+  to Chat Completions format, dispatched normally, and the response is piped through this
+  transform stream before reaching the client.
 
 ### Services (`open-sse/services/`)
 
@@ -190,7 +294,46 @@ Includes request/response translators with helpers for image handling.
 `autoCombo/`, `intentClassifier.ts`, `taskAwareRouter.ts`, `thinkingBudget.ts`,
 `contextManager.ts`, `modelDeprecation.ts`, `modelFamilyFallback.ts`,
 `emergencyFallback.ts`, `workflowFSM.ts`, `backgroundTaskDetector.ts`, `ipFilter.ts`,
-`signatureCache.ts`, `volumeDetector.ts`, `contextHandoff.ts`, and more.
+`signatureCache.ts`, `volumeDetector.ts`, `contextHandoff.ts`, `compression/` (prompt
+compression pipeline), and more.
+
+#### Prompt Compression Pipeline (`compression/`)
+
+Modular prompt compression that runs proactively before the existing reactive context manager.
+
+- **`strategySelector.ts`**: Selects compression mode based on config, compression combo assignments,
+  combo overrides, auto-trigger thresholds, and defaults. Priority: assigned compression combo >
+  combo override > auto-trigger > default mode > off.
+- **`lite.ts`**: 5 lite-mode techniques: `collapseWhitespace`, `dedupSystemPrompt`,
+  `compressToolResults`, `removeRedundantContent`, `replaceImageUrls`. Target: 10-15% savings at
+  <1ms latency.
+- **`caveman.ts` / `cavemanRules.ts`**: Caveman-style semantic condensation backed by built-in
+  rules plus file-loaded language packs under `compression/rules/`.
+- **`engines/rtk/`**: Rule-based terminal/tool-output compression inspired by RTK patterns. Detects
+  command output classes, applies JSON filter packs, deduplicates repeated lines, strips ANSI/code
+  noise, and preserves errors/actionable context. The RTK JSON DSL supports replace,
+  match-output short-circuit, strip/keep, per-line truncation, head/tail/max-line truncation,
+  inline tests, trust-gated project/global custom filters, and optional redacted raw-output
+  retention for authenticated recovery.
+- **`engines/registry.ts`**: Registers engines (`caveman`, `rtk`) and powers stacked pipelines.
+- **`stats.ts`**: Per-request compression stats tracking (original tokens, compressed tokens,
+  savings %, techniques used, engine breakdown, compression combo id).
+- **`types.ts`**: `CompressionMode` (off/lite/standard/aggressive/ultra/rtk/stacked),
+  `CompressionConfig`, `CompressionStats`, `CompressionResult`.
+- DB settings in `src/lib/db/compression.ts`, compression combos in
+  `src/lib/db/compressionCombos.ts`, API routes under `src/app/api/settings/compression/`,
+  `src/app/api/context/*`, and preview/language-pack routes under `src/app/api/compression/*`.
+
+#### Combo Routing Engine (`combo.ts`)
+
+- **`handleComboChat()`**: Entry point for combo-routed requests. Receives the combo config
+  and iterates through targets in order until one succeeds or all fail.
+- **`resolveComboTargets()`**: Expands a combo configuration into an ordered array of
+  `ResolvedComboTarget[]`, each specifying provider + model + account + credentials.
+- **Strategies** (14): priority, weighted, fill-first, round-robin, P2C, random, least-used, reset-aware (v3.8),
+  cost-optimized, strict-random, auto, lkgp, context-optimized, context-relay.
+- Each target calls **`handleSingleModel()`** which wraps `handleChatCore()` with
+  per-target error handling and circuit breaker checks.
 
 ### Domain Layer (`src/domain/`)
 
@@ -200,22 +343,54 @@ Policy engine modules: `policyEngine.ts`, `comboResolver.ts`, `costRules.ts`,
 
 ### MCP Server (`open-sse/mcp-server/`)
 
-25 tools, 3 transports (stdio / SSE / Streamable HTTP). Scoped auth (10 scopes), Zod schemas.
+37 tools (30 base + 3 memory + 4 skills), 3 transports (stdio / SSE / Streamable HTTP). Scoped auth (~13 scopes), Zod schemas. See [`docs/frameworks/MCP-SERVER.md`](docs/frameworks/MCP-SERVER.md).
 
-**Core tools** (18): get_health, list_combos, get_combo_metrics, switch_combo, check_quota,
-route_request, cost_report, list_models_catalog, simulate_route, set_budget_guard,
+**Core tools** (20): get_health, list_combos, get_combo_metrics, switch_combo, check_quota,
+route_request, cost_report, list_models_catalog, web_search, simulate_route, set_budget_guard,
 set_routing_strategy, set_resilience_profile, test_combo, get_provider_metrics,
-best_combo_for_task, explain_route, get_session_snapshot, sync_pricing.
+best_combo_for_task, explain_route, get_session_snapshot, db_health_check, sync_pricing.
+
+**Cache tools** (2): cache_stats, cache_flush.
+
+**Compression tools** (5): compression_status, compression_configure, set_compression_engine,
+list_compression_combos, compression_combo_stats.
+
+**1proxy tools** (3): oneproxy_fetch, oneproxy_rotate, oneproxy_stats.
 
 **Memory tools** (3): memory_search, memory_add, memory_clear.
 
 **Skill tools** (4): skills_list, skills_enable, skills_execute, skills_executions.
 
+#### MCP Internals
+
+- **Tool registration**: Each tool is an object with `{ name, description, inputSchema: ZodSchema,
+handler: async (args) => {...} }`. Zod validates inputs before the handler fires.
+- **`createMcpServer()`** and **`startMcpStdio()`** exported from `mcp-server/index.ts`.
+  `createMcpServer()` wires all tool sets; `startMcpStdio()` launches the stdio transport.
+- **Transports**: stdio (CLI `omniroute --mcp`), SSE (`/api/mcp/sse`), Streamable HTTP
+  (`/api/mcp/stream`). All share the same tool/scope engine.
+- **Scopes** (10): Control which tool categories an API key can access. Enforcement happens
+  before handler dispatch.
+- **Audit**: Every tool invocation is logged to SQLite (`mcp_audit` table) with tool name,
+  args, success/failure, API key attribution, and timestamp.
+
 ### A2A Server (`src/lib/a2a/`)
 
-JSON-RPC 2.0, SSE streaming, Task Manager with TTL cleanup(
+JSON-RPC 2.0, SSE streaming, Task Manager with TTL cleanup.
 Agent Card at `/.well-known/agent.json`.
-Skills: `quotaManagement.ts`, `smartRouting.ts`.
+Skills (5): `smartRouting.ts`, `quotaManagement.ts`, `providerDiscovery.ts`, `costAnalysis.ts`, `healthReport.ts`.
+
+#### A2A Internals
+
+- **`taskManager.ts`**: State machine lifecycle for tasks: `submitted → working →
+completed | failed | canceled`. Tasks have TTL and are cleaned up automatically.
+- **JSON-RPC methods**: `message/send` (sync), `message/stream` (SSE), `tasks/get`,
+  `tasks/cancel`. Dispatched via `POST /a2a`.
+- **Skills**: Registered in a DB-backed registry. Each skill receives task context
+  (messages, metadata) and returns structured results. `quotaManagement.ts` summarizes
+  quota; `smartRouting.ts` recommends routing decisions.
+- **Agent Card**: `/.well-known/agent.json` exposes capabilities, skills, and metadata
+  for client auto-discovery.
 
 ### ACP Module (`src/lib/acp/`)
 
@@ -231,6 +406,19 @@ conversational memory across sessions.
 Extensible skill framework: registry, executor, sandbox, built-in skills,
 custom skill support, interception, and injection.
 
+#### Skills Internals
+
+- **`registry.ts`**: DB-backed skill registration and discovery. Skills have metadata
+  (name, description, version, enabled status) stored in SQLite.
+- **`executor.ts`**: Execution engine with configurable timeout and retry logic.
+  Receives skill name + input, looks up the skill, runs it in the sandbox.
+- **`sandbox.ts`**: Isolation layer for custom (user-provided) skills. Limits resource
+  access and execution time.
+- **Built-in skills**: Ship with OmniRoute (e.g., quota management, routing). Located
+  alongside the registry.
+- **Interception/Injection**: Skills can intercept requests in the pipeline (pre/post
+  processing) or inject context into prompts.
+
 ### Compliance (`src/lib/compliance/`)
 
 Policy index for compliance enforcement.
@@ -243,6 +431,34 @@ MITM proxy capability with certificate management, DNS handling, and target rout
 
 Request middleware including `promptInjectionGuard.ts`.
 
+### Guardrails (`src/lib/guardrails/`)
+
+Hot-reloadable guardrails framework (3 built-in: pii-masker, prompt-injection, vision-bridge). Fail-open; per-request opt-out via header. See [`docs/security/GUARDRAILS.md`](docs/security/GUARDRAILS.md).
+
+### Cloud Agents (`src/lib/cloudAgent/`)
+
+`CloudAgentBase` abstract class + 3 agents (codex-cloud, devin, jules). Tasks persisted in `cloud_agent_tasks`; management auth required. See [`docs/frameworks/CLOUD_AGENT.md`](docs/frameworks/CLOUD_AGENT.md).
+
+### Evals (`src/lib/evals/`)
+
+Generic eval framework: `evalRunner.ts`, `runtime.ts`. Targets: combo / model / suite-default. See [`docs/frameworks/EVALS.md`](docs/frameworks/EVALS.md).
+
+### Webhooks (`src/lib/webhookDispatcher.ts`)
+
+HMAC-signed delivery, exponential backoff, auto-disable after 10 failures. 7 event types. See [`docs/frameworks/WEBHOOKS.md`](docs/frameworks/WEBHOOKS.md).
+
+### Authorization Pipeline (`src/server/authz/`)
+
+`classify → policies → enforce`. 3 route classes (PUBLIC / CLIENT_API / MANAGEMENT). See [`docs/architecture/AUTHZ_GUIDE.md`](docs/architecture/AUTHZ_GUIDE.md).
+
+### Reasoning Replay (`src/lib/db/reasoningCache.ts` + `open-sse/services/reasoningCache.ts`)
+
+Hybrid in-memory + SQLite cache for `reasoning_content`. Re-injects on multi-turn for strict providers (DeepSeek V4, Kimi K2, Qwen-Thinking, GLM, xiaomi-mimo). See [`docs/routing/REASONING_REPLAY.md`](docs/routing/REASONING_REPLAY.md).
+
+### Tunnels (`src/lib/{cloudflaredTunnel,ngrokTunnel}.ts` + `src/app/api/tunnels/`)
+
+Cloudflare Quick/Named, ngrok, Tailscale Funnel. See [`docs/ops/TUNNELS_GUIDE.md`](docs/ops/TUNNELS_GUIDE.md).
+
 ### Adding a New Provider
 
 1. Register in `src/shared/constants/providers.ts`
@@ -250,6 +466,44 @@ Request middleware including `promptInjectionGuard.ts`.
 3. Add translator in `open-sse/translator/` (if non-OpenAI format)
 4. Add OAuth config in `src/lib/oauth/constants/oauth.ts` (if OAuth-based)
 5. Add models in `open-sse/config/providerRegistry.ts`
+
+---
+
+## Subdirectory AGENTS.md Files
+
+- **[`open-sse/AGENTS.md`](open-sse/AGENTS.md)** — Streaming engine, request pipeline, handlers, and executors
+- **[`src/lib/db/AGENTS.md`](src/lib/db/AGENTS.md)** — SQLite persistence, domain modules, migrations
+- **[`open-sse/services/AGENTS.md`](open-sse/services/AGENTS.md)** — Routing engine, combo resolution, strategy selection
+
+## Reference Documentation (docs/)
+
+For any non-trivial change, read the matching deep-dive first:
+
+| Area                                 | Doc                                                                                                                                 |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Repo navigation                      | [`docs/architecture/REPOSITORY_MAP.md`](docs/architecture/REPOSITORY_MAP.md)                                                        |
+| Architecture                         | [`docs/architecture/ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md)                                                            |
+| Engineering reference                | [`docs/architecture/CODEBASE_DOCUMENTATION.md`](docs/architecture/CODEBASE_DOCUMENTATION.md)                                        |
+| Auto-Combo (9-factor, 14 strategies) | [`docs/routing/AUTO-COMBO.md`](docs/routing/AUTO-COMBO.md)                                                                          |
+| Resilience (3 layers)                | [`docs/architecture/RESILIENCE_GUIDE.md`](docs/architecture/RESILIENCE_GUIDE.md)                                                    |
+| Skills                               | [`docs/frameworks/SKILLS.md`](docs/frameworks/SKILLS.md)                                                                            |
+| Memory                               | [`docs/frameworks/MEMORY.md`](docs/frameworks/MEMORY.md)                                                                            |
+| Cloud agents                         | [`docs/frameworks/CLOUD_AGENT.md`](docs/frameworks/CLOUD_AGENT.md)                                                                  |
+| Guardrails                           | [`docs/security/GUARDRAILS.md`](docs/security/GUARDRAILS.md)                                                                        |
+| Evals                                | [`docs/frameworks/EVALS.md`](docs/frameworks/EVALS.md)                                                                              |
+| Compliance                           | [`docs/security/COMPLIANCE.md`](docs/security/COMPLIANCE.md)                                                                        |
+| Webhooks                             | [`docs/frameworks/WEBHOOKS.md`](docs/frameworks/WEBHOOKS.md)                                                                        |
+| Authz                                | [`docs/architecture/AUTHZ_GUIDE.md`](docs/architecture/AUTHZ_GUIDE.md)                                                              |
+| Stealth                              | [`docs/security/STEALTH_GUIDE.md`](docs/security/STEALTH_GUIDE.md)                                                                  |
+| Reasoning replay                     | [`docs/routing/REASONING_REPLAY.md`](docs/routing/REASONING_REPLAY.md)                                                              |
+| Agent protocols (A2A / ACP / Cloud)  | [`docs/frameworks/AGENT_PROTOCOLS_GUIDE.md`](docs/frameworks/AGENT_PROTOCOLS_GUIDE.md)                                              |
+| MCP server                           | [`docs/frameworks/MCP-SERVER.md`](docs/frameworks/MCP-SERVER.md)                                                                    |
+| A2A server                           | [`docs/frameworks/A2A-SERVER.md`](docs/frameworks/A2A-SERVER.md)                                                                    |
+| API reference                        | [`docs/reference/API_REFERENCE.md`](docs/reference/API_REFERENCE.md) + [`docs/reference/openapi.yaml`](docs/reference/openapi.yaml) |
+| Provider catalog (auto-generated)    | [`docs/reference/PROVIDER_REFERENCE.md`](docs/reference/PROVIDER_REFERENCE.md)                                                      |
+| Tunnels                              | [`docs/ops/TUNNELS_GUIDE.md`](docs/ops/TUNNELS_GUIDE.md)                                                                            |
+| Electron desktop                     | [`docs/guides/ELECTRON_GUIDE.md`](docs/guides/ELECTRON_GUIDE.md)                                                                    |
+| Release flow                         | [`docs/ops/RELEASE_CHECKLIST.md`](docs/ops/RELEASE_CHECKLIST.md)                                                                    |
 
 ---
 
@@ -264,3 +518,4 @@ Request middleware including `promptInjectionGuard.ts`.
 - **Provider constants** validated at module load via Zod (`src/shared/validation/providerSchema.ts`)
 - **Pricing data** syncs from LiteLLM via `src/lib/pricingSync.ts`
 - **Memory/Skills** are cross-cutting: affect MCP tools, request pipeline, and A2A skills
+- **⛔ NEVER close a contributor's PR** after using their code — always merge via GitHub so they get credit. See `.agents/workflows/review-prs.md` for full policy.

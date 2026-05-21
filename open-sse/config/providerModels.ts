@@ -16,6 +16,12 @@ export function getDefaultModel(aliasOrId: string): string | null {
   return models?.[0]?.id || null;
 }
 
+export function getProviderModel(aliasOrId: string, modelId: string): RegistryModel | undefined {
+  const models = PROVIDER_MODELS[aliasOrId];
+  if (!models) return undefined;
+  return models.find((model) => model.id === modelId);
+}
+
 export function isValidModel(
   aliasOrId: string,
   modelId: string,
@@ -41,7 +47,22 @@ export function getModelTargetFormat(aliasOrId: string, modelId: string): string
   return found?.targetFormat || null;
 }
 
+export function getModelStripTypes(aliasOrId: string, modelId: string): string[] {
+  const models = PROVIDER_MODELS[aliasOrId];
+  if (!models) return [];
+  const found = models.find((m) => m.id === modelId);
+  return Array.isArray(found?.strip) ? [...found.strip] : [];
+}
+
 export function getModelsByProviderId(providerId: string): RegistryModel[] {
   const alias = PROVIDER_ID_TO_ALIAS[providerId] || providerId;
   return PROVIDER_MODELS[alias] || [];
+}
+
+export function supportsXHighEffort(aliasOrId: string, modelId: string): boolean {
+  const alias = PROVIDER_ID_TO_ALIAS[aliasOrId] || aliasOrId;
+  const providerModels = PROVIDER_MODELS[alias] || PROVIDER_MODELS[aliasOrId];
+  // Unknown provider (not in registry) — pass through unchanged.
+  if (!providerModels) return true;
+  return getProviderModel(alias, modelId)?.supportsXHighEffort === true;
 }

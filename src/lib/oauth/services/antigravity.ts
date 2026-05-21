@@ -1,6 +1,11 @@
 import crypto from "crypto";
 import open from "open";
 import { ANTIGRAVITY_CONFIG } from "../constants/oauth";
+import {
+  antigravityNativeOAuthUserAgent,
+  getAntigravityHeaders,
+  getAntigravityLoadCodeAssistMetadata,
+} from "@omniroute/open-sse/services/antigravityHeaders.ts";
 import { getServerCredentials } from "../config/index";
 import { startLocalServer } from "../utils/server";
 import { spinner as createSpinner } from "../utils/ui";
@@ -42,6 +47,7 @@ export class AntigravityService {
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
         Accept: "application/json",
+        "User-Agent": antigravityNativeOAuthUserAgent(),
       },
       body: new URLSearchParams({
         grant_type: "authorization_code",
@@ -83,40 +89,53 @@ export class AntigravityService {
    * Get common headers for Antigravity API calls
    */
   getApiHeaders(accessToken: string) {
-    return {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      "User-Agent": this.config.loadCodeAssistUserAgent,
-      "X-Goog-Api-Client": this.config.loadCodeAssistApiClient,
-      "Client-Metadata": this.config.loadCodeAssistClientMetadata,
-    };
+    return getAntigravityHeaders("loadCodeAssist", accessToken);
   }
 
   /**
    * Get metadata object for API calls
    */
   getMetadata() {
-    return {
-      ideType: "IDE_UNSPECIFIED",
-      platform: "PLATFORM_UNSPECIFIED",
-      pluginType: "GEMINI",
-    };
+    return getAntigravityLoadCodeAssistMetadata();
+  }
+
+  private getEndpointList(key: string, fallbackKey: string) {
+    const endpoints = this.config[key];
+    if (Array.isArray(endpoints) && endpoints.length > 0) return endpoints;
+    const fallback = this.config[fallbackKey];
+    return typeof fallback === "string" && fallback ? [fallback] : [];
+  }
+
+  private async fetchFirstOk(endpoints: string[], init: RequestInit, label: string) {
+    let lastError: unknown = null;
+    for (const endpoint of endpoints) {
+      try {
+        const response = await fetch(endpoint, init);
+        if (response.ok) return response;
+        lastError = new Error(`${response.status} ${await response.text()}`);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    const message =
+      lastError instanceof Error ? lastError.message : String(lastError || "no endpoints");
+    throw new Error(`Failed to ${label}: ${message}`);
   }
 
   /**
    * Fetch Project ID and Tier from loadCodeAssist API
    */
   async loadCodeAssist(accessToken: string) {
-    const response = await fetch(this.config.loadCodeAssistEndpoint, {
-      method: "POST",
-      headers: this.getApiHeaders(accessToken),
-      body: JSON.stringify({ metadata: this.getMetadata() }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Failed to load code assist: ${errorText}`);
-    }
+    const response = await this.fetchFirstOk(
+      this.getEndpointList("loadCodeAssistEndpoints", "loadCodeAssistEndpoint"),
+      {
+        method: "POST",
+        headers: this.getApiHeaders(accessToken),
+        body: JSON.stringify({ metadata: this.getMetadata() }),
+      },
+      "load code assist"
+    );
 
     const data = await response.json();
 
@@ -143,21 +162,19 @@ export class AntigravityService {
   /**
    * Onboard user to enable Gemini Code Assist for the project
    */
-  async onboardUser(accessToken: string, projectId: string, tierId: string) {
-    const response = await fetch(this.config.onboardUserEndpoint, {
-      method: "POST",
-      headers: this.getApiHeaders(accessToken),
-      body: JSON.stringify({
-        tierId,
-        metadata: this.getMetadata(),
-        cloudaicompanionProject: projectId,
-      }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Failed to onboard user: ${errorText}`);
-    }
+  async onboardUser(accessToken: string, tierId: string) {
+    const response = await this.fetchFirstOk(
+      this.getEndpointList("onboardUserEndpoints", "onboardUserEndpoint"),
+      {
+        method: "POST",
+        headers: this.getApiHeaders(accessToken),
+        body: JSON.stringify({
+          tier_id: tierId,
+          metadata: this.getMetadata(),
+        }),
+      },
+      "onboard user"
+    );
 
     return await response.json();
   }
@@ -172,7 +189,7 @@ export class AntigravityService {
     maxRetries = 10
   ) {
     for (let i = 0; i < maxRetries; i++) {
-      const result = await this.onboardUser(accessToken, projectId, tierId);
+      const result = await this.onboardUser(accessToken, tierId);
 
       if (result.done === true) {
         // Extract final project ID from response

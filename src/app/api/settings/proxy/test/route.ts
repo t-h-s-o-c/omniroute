@@ -9,6 +9,7 @@ import { testProxySchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { createErrorResponse, createErrorResponseFromUnknown } from "@/lib/api/errorResponse";
 import { getProxyById } from "@/lib/localDb";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
 const BASE_SUPPORTED_PROXY_TYPES = new Set(["http", "https"]);
 
@@ -36,6 +37,9 @@ function supportedTypesMessage() {
  * Returns: { success, publicIp?, latencyMs?, error? }
  */
 export async function POST(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   let rawBody: unknown;
   try {
     rawBody = await request.json();
@@ -137,7 +141,7 @@ export async function POST(request: Request) {
     const dispatcher = createProxyDispatcher(proxyUrl);
 
     try {
-      const result = await undiciRequest("https://api.ipify.org?format=json", {
+      const result = await undiciRequest("https://api64.ipify.org?format=json", {
         method: "GET",
         dispatcher,
         signal: controller.signal,

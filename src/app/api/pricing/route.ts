@@ -1,5 +1,12 @@
 import { NextResponse } from "next/server";
-import { getPricing, updatePricing, resetPricing, resetAllPricing } from "@/lib/localDb";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import {
+  getPricing,
+  getPricingWithSources,
+  updatePricing,
+  resetPricing,
+  resetAllPricing,
+} from "@/lib/localDb";
 import { updatePricingSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
@@ -7,8 +14,16 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
  * GET /api/pricing
  * Get current pricing configuration (merged user + defaults)
  */
-export async function GET() {
+export async function GET(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   try {
+    const includeSources = new URL(request.url).searchParams.get("includeSources") === "1";
+    if (includeSources) {
+      return NextResponse.json(await getPricingWithSources());
+    }
+
     const pricing = await getPricing();
     return NextResponse.json(pricing);
   } catch (error) {
@@ -23,6 +38,9 @@ export async function GET() {
  * Body: { provider: { model: { input: number, output: number, cached: number, ... } } }
  */
 export async function PATCH(request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();
@@ -59,6 +77,9 @@ export async function PATCH(request) {
  * Query params: ?provider=xxx&model=yyy (optional)
  */
 export async function DELETE(request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   try {
     const { searchParams } = new URL(request.url);
     const provider = searchParams.get("provider");

@@ -3,8 +3,9 @@ import { randomUUID } from "crypto";
  * Search Handler
  *
  * Handles POST /v1/search requests.
- * Routes to 5 search providers with automatic failover:
- *   serper-search, brave-search, perplexity-search, exa-search, tavily-search
+ * Routes to 11 search providers with automatic failover:
+ *   serper-search, brave-search, perplexity-search, exa-search, tavily-search,
+ *   google-pse-search, linkup-search, searchapi-search, youcom-search, searxng-search, ollama-search, zai-search
  *
  * Request format:
  * {
@@ -17,6 +18,10 @@ import { randomUUID } from "crypto";
 
 import { getSearchProvider, type SearchProviderConfig } from "../config/searchRegistry.ts";
 import { saveCallLog } from "@/lib/usageDb";
+import { safeOutboundFetch } from "@/shared/network/safeOutboundFetch";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { z } from "zod";
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -231,16 +236,53 @@ function parseDomainFilter(domainFilter?: string[]): {
   return { includes, excludes };
 }
 
+function getProviderSettingString(
+  params: Pick<SearchRequestParams, "providerOptions" | "providerSpecificData">,
+  key: string
+): string | undefined {
+  const fromOptions = params.providerOptions?.[key];
+  if (typeof fromOptions === "string" && fromOptions.trim().length > 0) {
+    return fromOptions.trim();
+  }
+
+  const fromProviderData = params.providerSpecificData?.[key];
+  if (typeof fromProviderData === "string" && fromProviderData.trim().length > 0) {
+    return fromProviderData.trim();
+  }
+
+  return undefined;
+}
+
+function resolveSearchBaseUrl(config: SearchProviderConfig, params: SearchRequestParams): string {
+  const override = getProviderSettingString(params, "baseUrl");
+  return (override || config.baseUrl).replace(/\/+$/, "");
+}
+
+function toSearchPageNumber(offset: number | undefined, maxResults: number): number | undefined {
+  if (typeof offset !== "number" || offset <= 0 || maxResults <= 0) return undefined;
+  return Math.floor(offset / maxResults) + 1;
+}
+
 // ── Provider Request Builders ───────────────────────────────────────────
 
 interface SearchRequestParams {
   query: string;
   searchType: string;
   maxResults: number;
-  token: string;
+  token?: string;
   country?: string;
   language?: string;
+  timeRange?: string;
+  offset?: number;
   domainFilter?: string[];
+  contentOptions?: {
+    snippet?: boolean;
+    full_page?: boolean;
+    format?: string;
+    max_characters?: number;
+  };
+  providerOptions?: Record<string, unknown>;
+  providerSpecificData?: Record<string, unknown>;
 }
 
 function buildSerperRequest(
@@ -344,6 +386,226 @@ function buildTavilyRequest(
   };
 }
 
+function buildGooglePseRequest(
+  config: SearchProviderConfig,
+  params: SearchRequestParams
+): { url: string; init: RequestInit } {
+  const apiKey = params.token;
+  const cx = getProviderSettingString(params, "cx");
+  if (!apiKey || !cx) {
+    throw new Error("Google Programmable Search requires both apiKey and cx");
+  }
+
+  const qp = new URLSearchParams({
+    key: apiKey,
+    cx,
+    q: params.query,
+    num: String(Math.min(params.maxResults, 10)),
+  });
+
+  if (params.country) qp.set("gl", params.country.toLowerCase());
+  if (params.language) qp.set("hl", params.language);
+  if (params.timeRange && params.timeRange !== "any") {
+    const dateRestrictMap: Record<string, string> = {
+      day: "d1",
+      week: "w1",
+      month: "m1",
+      year: "y1",
+    };
+    const dateRestrict = dateRestrictMap[params.timeRange];
+    if (dateRestrict) qp.set("dateRestrict", dateRestrict);
+  }
+  if (typeof params.offset === "number" && params.offset > 0) {
+    qp.set("start", String(Math.min(params.offset + 1, 91)));
+  }
+
+  return {
+    url: `${resolveSearchBaseUrl(config, params)}?${qp}`,
+    init: {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    },
+  };
+}
+
+function buildLinkupRequest(
+  config: SearchProviderConfig,
+  params: SearchRequestParams
+): { url: string; init: RequestInit } {
+  const apiKey = params.token;
+  if (!apiKey) {
+    throw new Error("Linkup Search requires an API key");
+  }
+
+  const { includes, excludes } = parseDomainFilter(params.domainFilter);
+  const requestedDepth = getProviderSettingString(params, "depth");
+  const depth =
+    requestedDepth && ["fast", "standard", "deep"].includes(requestedDepth)
+      ? requestedDepth
+      : "standard";
+
+  const body: Record<string, unknown> = {
+    q: params.query,
+    depth,
+    outputType: "searchResults",
+    maxResults: params.maxResults,
+  };
+
+  if (includes.length) body.includeDomains = includes;
+  if (excludes.length) body.excludeDomains = excludes;
+  if (params.timeRange && params.timeRange !== "any") {
+    const today = new Date();
+    const toDate = today.toISOString().slice(0, 10);
+    const from = new Date(today);
+    if (params.timeRange === "day") from.setUTCDate(from.getUTCDate() - 1);
+    if (params.timeRange === "week") from.setUTCDate(from.getUTCDate() - 7);
+    if (params.timeRange === "month") from.setUTCMonth(from.getUTCMonth() - 1);
+    if (params.timeRange === "year") from.setUTCFullYear(from.getUTCFullYear() - 1);
+    body.fromDate = from.toISOString().slice(0, 10);
+    body.toDate = toDate;
+  }
+
+  return {
+    url: resolveSearchBaseUrl(config, params),
+    init: {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+function buildSearchApiRequest(
+  config: SearchProviderConfig,
+  params: SearchRequestParams
+): { url: string; init: RequestInit } {
+  const apiKey = params.token;
+  if (!apiKey) {
+    throw new Error("SearchAPI requires an API key");
+  }
+
+  const qp = new URLSearchParams({
+    engine: params.searchType === "news" ? "google_news" : "google",
+    q: params.query,
+    api_key: apiKey,
+  });
+
+  if (params.country) qp.set("gl", params.country.toLowerCase());
+  if (params.language) qp.set("hl", params.language);
+
+  const page = toSearchPageNumber(params.offset, params.maxResults);
+  if (page) qp.set("page", String(page));
+
+  return {
+    url: `${resolveSearchBaseUrl(config, params)}?${qp}`,
+    init: {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    },
+  };
+}
+
+function buildYouComRequest(
+  config: SearchProviderConfig,
+  params: SearchRequestParams
+): { url: string; init: RequestInit } {
+  const apiKey = params.token;
+  if (!apiKey) {
+    throw new Error("You.com Search requires an API key");
+  }
+
+  const { includes, excludes } = parseDomainFilter(params.domainFilter);
+  const qp = new URLSearchParams({
+    query: params.query,
+    count: String(Math.min(params.maxResults, 100)),
+  });
+
+  if (params.timeRange && params.timeRange !== "any") {
+    qp.set("freshness", params.timeRange);
+  }
+  if (typeof params.offset === "number" && params.offset > 0 && params.maxResults > 0) {
+    qp.set("offset", String(Math.min(Math.floor(params.offset / params.maxResults), 9)));
+  }
+  if (params.country) qp.set("country", params.country);
+  if (params.language) qp.set("language", params.language);
+  if (includes.length) qp.set("include_domains", includes.join(","));
+  if (excludes.length) qp.set("exclude_domains", excludes.join(","));
+
+  if (params.contentOptions?.full_page) {
+    qp.set("livecrawl", params.searchType === "news" ? "news" : "web");
+    qp.append(
+      "livecrawl_formats",
+      params.contentOptions.format === "markdown" ? "markdown" : "html"
+    );
+  }
+
+  return {
+    url: `${resolveSearchBaseUrl(config, params)}?${qp}`,
+    init: {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "X-API-Key": apiKey,
+      },
+    },
+  };
+}
+
+function buildSearxngRequest(
+  config: SearchProviderConfig,
+  params: SearchRequestParams
+): { url: string; init: RequestInit } {
+  const baseUrl = resolveSearchBaseUrl(config, params);
+  const url = baseUrl.endsWith("/search") ? baseUrl : `${baseUrl}/search`;
+  const qp = new URLSearchParams({
+    q: params.query,
+    format: "json",
+    categories: params.searchType === "news" ? "news" : "general",
+  });
+
+  if (params.language) qp.set("language", params.language);
+  if (params.timeRange && params.timeRange !== "any") qp.set("time_range", params.timeRange);
+
+  const page = toSearchPageNumber(params.offset, params.maxResults);
+  if (page) qp.set("pageno", String(page));
+
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (params.token) {
+    headers["Authorization"] = `Bearer ${params.token}`;
+  }
+
+  return {
+    url: `${url}?${qp}`,
+    init: {
+      method: "GET",
+      headers,
+    },
+  };
+}
+
+function buildOllamaRequest(
+  config: SearchProviderConfig,
+  params: SearchRequestParams
+): { url: string; init: RequestInit } {
+  return {
+    url: resolveSearchBaseUrl(config, params),
+    init: {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(params.token ? { Authorization: `Bearer ${params.token}` } : {}),
+      },
+      body: JSON.stringify({
+        query: params.query,
+        max_results: params.maxResults,
+      }),
+    },
+  };
+}
+
 function buildRequest(
   config: SearchProviderConfig,
   params: SearchRequestParams
@@ -353,12 +615,21 @@ function buildRequest(
   if (config.id === "perplexity-search") return buildPerplexityRequest(config, params);
   if (config.id === "exa-search") return buildExaRequest(config, params);
   if (config.id === "tavily-search") return buildTavilyRequest(config, params);
+  if (config.id === "google-pse-search") return buildGooglePseRequest(config, params);
+  if (config.id === "linkup-search") return buildLinkupRequest(config, params);
+  if (config.id === "searchapi-search") return buildSearchApiRequest(config, params);
+  if (config.id === "youcom-search") return buildYouComRequest(config, params);
+  if (config.id === "searxng-search") return buildSearxngRequest(config, params);
+  if (config.id === "ollama-search") return buildOllamaRequest(config, params);
   // Fallback for future providers: POST with bearer auth
   return {
-    url: config.baseUrl,
+    url: resolveSearchBaseUrl(config, params),
     init: {
       method: config.method,
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${params.token}` },
+      headers: {
+        "Content-Type": "application/json",
+        ...(params.token ? { Authorization: `Bearer ${params.token}` } : {}),
+      },
       body: JSON.stringify({
         query: params.query,
         max_results: params.maxResults,
@@ -452,6 +723,452 @@ function normalizeTavilyResponse(
   return { results, totalResults: results.length };
 }
 
+function normalizeGooglePseResponse(
+  data: any,
+  _query: string,
+  _searchType: string
+): { results: SearchResult[]; totalResults: number | null } {
+  const now = new Date().toISOString();
+  const items = Array.isArray(data.items) ? data.items : [];
+  const results = items.map((item: any, idx: number) =>
+    makeResult(
+      "google-pse-search",
+      {
+        title: item.title,
+        url: item.link,
+        snippet: item.snippet,
+        image_url:
+          item.pagemap?.cse_image?.[0]?.src ||
+          item.pagemap?.cse_thumbnail?.[0]?.src ||
+          item.pagemap?.metatags?.[0]?.["og:image"],
+      },
+      idx,
+      now
+    )
+  );
+
+  const totalResultsRaw =
+    data.searchInformation?.totalResults ?? data.queries?.request?.[0]?.totalResults ?? null;
+  const totalResults =
+    typeof totalResultsRaw === "string" ? Number(totalResultsRaw) : totalResultsRaw;
+
+  return {
+    results,
+    totalResults: Number.isFinite(totalResults) ? totalResults : null,
+  };
+}
+
+function normalizeLinkupResponse(
+  data: any,
+  _query: string,
+  _searchType: string
+): { results: SearchResult[]; totalResults: number | null } {
+  const now = new Date().toISOString();
+  const items = Array.isArray(data.results) ? data.results : [];
+  const results = items.map((item: any, idx: number) =>
+    makeResult(
+      "linkup-search",
+      {
+        title: item.name || item.title,
+        url: item.url,
+        snippet: item.content || item.snippet || "",
+        source_type: item.type || "web",
+        image_url: item.image_url || item.imageUrl || null,
+        full_text: item.content,
+        text_format: "text",
+      },
+      idx,
+      now
+    )
+  );
+
+  return { results, totalResults: results.length };
+}
+
+function normalizeSearchApiResponse(
+  data: any,
+  _query: string,
+  _searchType: string
+): { results: SearchResult[]; totalResults: number | null } {
+  const now = new Date().toISOString();
+  const items = Array.isArray(data.organic_results)
+    ? data.organic_results
+    : Array.isArray(data.top_stories)
+      ? data.top_stories
+      : [];
+
+  const results = items.map((item: any, idx: number) =>
+    makeResult(
+      "searchapi-search",
+      {
+        title: item.title,
+        url: item.link,
+        snippet: item.snippet || item.description || "",
+        published_at: item.date || item.published_at,
+        favicon_url: item.favicon,
+        author: item.source || null,
+        image_url: item.thumbnail || null,
+      },
+      idx,
+      now
+    )
+  );
+
+  const totalResults =
+    typeof data.search_information?.total_results === "number"
+      ? data.search_information.total_results
+      : typeof data.search_information?.total_results === "string"
+        ? Number(data.search_information.total_results)
+        : null;
+
+  return {
+    results,
+    totalResults: Number.isFinite(totalResults) ? totalResults : results.length,
+  };
+}
+
+function normalizeYouComResponse(
+  data: any,
+  _query: string,
+  searchType: string
+): { results: SearchResult[]; totalResults: number | null } {
+  const now = new Date().toISOString();
+  const resultsContainer =
+    data?.results && typeof data.results === "object" ? data.results : undefined;
+  const section =
+    searchType === "news" ? resultsContainer?.news || [] : resultsContainer?.web || [];
+  const items = Array.isArray(section) ? section : [];
+
+  const results = items.map((item: any, idx: number) => {
+    const firstSnippet = Array.isArray(item.snippets)
+      ? item.snippets.find((value: unknown) => typeof value === "string")
+      : null;
+    const livecrawlText =
+      typeof item.markdown === "string"
+        ? item.markdown
+        : typeof item.html === "string"
+          ? item.html
+          : undefined;
+    const livecrawlFormat = typeof item.markdown === "string" ? "markdown" : "html";
+
+    return makeResult(
+      "youcom-search",
+      {
+        title: item.title,
+        url: item.url,
+        snippet:
+          typeof firstSnippet === "string"
+            ? firstSnippet
+            : typeof item.description === "string"
+              ? item.description
+              : "",
+        published_at: item.page_age,
+        favicon_url: item.favicon_url,
+        image_url: item.thumbnail_url,
+        source_type: searchType,
+        full_text: livecrawlText,
+        text_format: livecrawlText ? livecrawlFormat : undefined,
+      },
+      idx,
+      now
+    );
+  });
+
+  return { results, totalResults: results.length };
+}
+
+function normalizeSearxngResponse(
+  data: any,
+  _query: string,
+  _searchType: string
+): { results: SearchResult[]; totalResults: number | null } {
+  const now = new Date().toISOString();
+  const items = Array.isArray(data.results) ? data.results : [];
+
+  const results = items.map((item: any, idx: number) =>
+    makeResult(
+      "searxng-search",
+      {
+        title: item.title,
+        url: item.url,
+        snippet: item.content || item.snippet || "",
+        published_at: item.publishedDate || item.published_date || null,
+        source_type: Array.isArray(item.engines)
+          ? item.engines.join(", ")
+          : item.engine || item.category || null,
+        image_url: item.thumbnail || item.img_src || null,
+      },
+      idx,
+      now
+    )
+  );
+
+  return { results, totalResults: results.length };
+}
+
+function normalizeOllamaResponse(
+  data: any,
+  _query: string,
+  _searchType: string
+): { results: SearchResult[]; totalResults: number | null } {
+  const now = new Date().toISOString();
+  const items = Array.isArray(data?.results) ? data.results : [];
+
+  const results = items.map((item: any, idx: number) =>
+    makeResult(
+      "ollama-search",
+      {
+        title: item?.title,
+        url: item?.url,
+        snippet: item?.content || "",
+        full_text: item?.content,
+        text_format: "text",
+      },
+      idx,
+      now
+    )
+  );
+
+  return { results, totalResults: results.length };
+}
+
+// ── Z.AI Coding Plan Search MCP Execution ───────────────────────────
+
+// Schema for the Z.AI MCP web_search_prime tool result. Z.AI double-encodes
+// the results array as a JSON string inside the MCP text content, so we
+// safely unwrap it with a typed schema instead of `JSON.parse(parsed)`.
+const ZaiSearchItemSchema = z
+  .object({
+    title: z.string().optional(),
+    link: z.string().optional(),
+    content: z.string().optional(),
+    publish_date: z.string().optional(),
+    icon: z.string().optional(),
+    media: z.string().optional(),
+  })
+  .passthrough();
+
+type ZaiSearchItem = z.infer<typeof ZaiSearchItemSchema>;
+
+const ZaiSearchResultsSchema = z.array(ZaiSearchItemSchema);
+
+/**
+ * Unwrap the double-encoded JSON from a Z.AI MCP web_search_prime response.
+ *
+ * Quirk: the MCP server returns a text content block whose body is a JSON
+ * string. That JSON string, once parsed, is itself another JSON string
+ * containing the actual results array. We try a single parse first
+ * (in case the upstream behavior ever changes), then a nested parse.
+ * Both paths are validated through `ZaiSearchResultsSchema` so any shape
+ * regression upstream lands in our error path instead of corrupting results.
+ */
+function unwrapZaiContent(rawText: string): ZaiSearchItem[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    return null;
+  }
+
+  // Direct array path (defensive, in case Z.AI stops double-encoding).
+  const direct = ZaiSearchResultsSchema.safeParse(parsed);
+  if (direct.success) return direct.data;
+
+  // Documented Z.AI behavior: parsed is a JSON string of the results array.
+  if (typeof parsed !== "string") return null;
+  let inner: unknown;
+  try {
+    inner = JSON.parse(parsed);
+  } catch {
+    return null;
+  }
+  const validated = ZaiSearchResultsSchema.safeParse(inner);
+  return validated.success ? validated.data : null;
+}
+
+async function zaiSearchExecute(params: {
+  config: SearchProviderConfig;
+  query: string;
+  token: string;
+  params: SearchRequestParams;
+  signal?: AbortSignal;
+}): Promise<{ results: SearchResult[]; totalResults: number | null }> {
+  const baseUrl = resolveSearchBaseUrl(params.config, params.params);
+  const transport = new StreamableHTTPClientTransport(new URL(baseUrl), {
+    fetch: safeOutboundFetch,
+    requestInit: {
+      headers: {
+        Authorization: `Bearer ${params.token}`,
+      },
+    },
+  });
+
+  const client = new Client({ name: "omniroute-search", version: "1.0" }, { capabilities: {} });
+
+  const { signal } = params;
+
+  let abortHandler: (() => void) | undefined;
+  if (signal) {
+    if (signal.aborted) {
+      throw new DOMException("The operation was aborted", "AbortError");
+    }
+    abortHandler = () => {
+      client.close().catch(() => {});
+    };
+    signal.addEventListener("abort", abortHandler, { once: true });
+  }
+
+  try {
+    await client.connect(transport);
+
+    if (signal?.aborted) {
+      throw new DOMException("The operation was aborted", "AbortError");
+    }
+
+    const args: Record<string, unknown> = {
+      search_query: params.query,
+    };
+
+    const { includes } = parseDomainFilter(params.params.domainFilter);
+    if (includes.length > 0) {
+      args.search_domain_filter = includes.join(",");
+    }
+
+    const toolResult = await client.callTool({
+      name: "web_search_prime",
+      arguments: args,
+    });
+
+    const rawContent = Array.isArray(toolResult.content) ? toolResult.content : [];
+    const rawText = rawContent
+      .filter((c: any) => c?.type === "text")
+      .map((c: any) => (typeof c?.text === "string" ? c.text : ""))
+      .join("\n");
+
+    if (!rawText.trim()) {
+      return { results: [], totalResults: null };
+    }
+
+    const items = unwrapZaiContent(rawText);
+    if (!items) {
+      return { results: [], totalResults: null };
+    }
+
+    const now = new Date().toISOString();
+    const results = items.map((item, idx) =>
+      makeResult(
+        "zai-search",
+        {
+          title: item.title,
+          url: item.link,
+          snippet: item.content || "",
+          published_at: item.publish_date,
+          favicon_url: item.icon,
+          source_type: item.media,
+        },
+        idx,
+        now
+      )
+    );
+    return { results, totalResults: results.length };
+  } finally {
+    if (abortHandler && signal) {
+      signal.removeEventListener("abort", abortHandler);
+    }
+    await client.close();
+  }
+}
+
+async function tryZaiMCPProvider(
+  config: SearchProviderConfig,
+  params: Omit<SearchRequestParams, "token">,
+  token: string,
+  providerSpecificData: Record<string, unknown> | undefined,
+  startTime: number,
+  globalStartTime: number,
+  log?: any
+): Promise<SearchHandlerResult> {
+  const { query, searchType, maxResults } = params;
+
+  const remainingGlobal = GLOBAL_TIMEOUT_MS - (Date.now() - globalStartTime);
+  const timeout = Math.min(config.timeoutMs, Math.max(remainingGlobal, 1000));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const normalized = await zaiSearchExecute({
+      config,
+      query,
+      token,
+      params: { ...params, token, providerSpecificData },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    const results = normalized.results.slice(0, maxResults);
+    const duration = Date.now() - startTime;
+
+    saveCallLog({
+      method: config.method,
+      path: "/v1/search",
+      status: 200,
+      model: config.id,
+      provider: config.id,
+      duration,
+      requestType: "search",
+      tokens: { prompt_tokens: 0, completion_tokens: 0 },
+      requestBody: { query: query.slice(0, 200), search_type: searchType, max_results: maxResults },
+      responseBody: { results_count: results.length, cached: false },
+    }).catch(() => {
+      /* non-critical — logging must not block search response */
+    });
+
+    return {
+      success: true,
+      data: {
+        provider: config.id,
+        query,
+        results,
+        answer: null,
+        usage: { queries_used: 1, search_cost_usd: config.costPerQuery },
+        metrics: {
+          response_time_ms: duration,
+          upstream_latency_ms: duration,
+          total_results_available: normalized.totalResults,
+        },
+        errors: [],
+      },
+    };
+  } catch (err: any) {
+    clearTimeout(timer);
+
+    const isTimeout = err.name === "AbortError";
+    if (log) {
+      log.error("SEARCH", `${config.id} MCP ${isTimeout ? "timeout" : "error"}: ${err.message}`);
+    }
+
+    saveCallLog({
+      method: config.method,
+      path: "/v1/search",
+      status: isTimeout ? 504 : 502,
+      model: config.id,
+      provider: config.id,
+      duration: Date.now() - startTime,
+      requestType: "search",
+      error: err.message,
+      requestBody: { query: query.slice(0, 200), search_type: searchType, max_results: maxResults },
+    }).catch(() => {
+      /* non-critical — logging must not block search response */
+    });
+
+    return {
+      success: false,
+      status: isTimeout ? 504 : 502,
+      error: `Search provider ${isTimeout ? "timeout" : "error"}: ${err.message}`,
+    };
+  }
+}
+
 function normalizeResponse(
   providerId: string,
   data: any,
@@ -464,6 +1181,13 @@ function normalizeResponse(
     return normalizePerplexityResponse(data, query, searchType);
   if (providerId === "exa-search") return normalizeExaResponse(data, query, searchType);
   if (providerId === "tavily-search") return normalizeTavilyResponse(data, query, searchType);
+  if (providerId === "google-pse-search")
+    return normalizeGooglePseResponse(data, query, searchType);
+  if (providerId === "linkup-search") return normalizeLinkupResponse(data, query, searchType);
+  if (providerId === "searchapi-search") return normalizeSearchApiResponse(data, query, searchType);
+  if (providerId === "youcom-search") return normalizeYouComResponse(data, query, searchType);
+  if (providerId === "searxng-search") return normalizeSearxngResponse(data, query, searchType);
+  if (providerId === "ollama-search") return normalizeOllamaResponse(data, query, searchType);
   return { results: [], totalResults: null };
 }
 
@@ -477,7 +1201,11 @@ export async function handleSearch(options: SearchHandlerOptions): Promise<Searc
     searchType,
     country,
     language,
+    timeRange,
+    offset,
     domainFilter,
+    contentOptions,
+    providerOptions,
     credentials,
     alternateProvider,
     alternateCredentials,
@@ -510,7 +1238,11 @@ export async function handleSearch(options: SearchHandlerOptions): Promise<Searc
     maxResults,
     country,
     language,
+    timeRange,
+    offset,
     domainFilter,
+    contentOptions,
+    providerOptions,
   };
 
   // 4. Try primary provider
@@ -554,9 +1286,13 @@ async function tryProvider(
   log?: any
 ): Promise<SearchHandlerResult> {
   const startTime = Date.now();
-  const token = credentials.apiKey || credentials.accessToken;
+  const providerSpecificData =
+    credentials?.providerSpecificData && typeof credentials.providerSpecificData === "object"
+      ? credentials.providerSpecificData
+      : undefined;
+  const token = credentials.apiKey || credentials.accessToken || undefined;
 
-  if (!token) {
+  if (config.authType !== "none" && !token) {
     return {
       success: false,
       status: 401,
@@ -565,7 +1301,30 @@ async function tryProvider(
   }
 
   const { query, searchType, maxResults } = params;
-  const { url, init } = buildRequest(config, { ...params, token });
+
+  if (config.id === "zai-search" && token) {
+    return tryZaiMCPProvider(
+      config,
+      params,
+      token,
+      providerSpecificData,
+      startTime,
+      globalStartTime,
+      log
+    );
+  }
+
+  let url = "";
+  let init: RequestInit = {};
+  try {
+    ({ url, init } = buildRequest(config, { ...params, token, providerSpecificData }));
+  } catch (err: any) {
+    return {
+      success: false,
+      status: 400,
+      error: err?.message || `Invalid search configuration for provider: ${config.id}`,
+    };
+  }
 
   // Timeout: min of provider timeout and remaining global timeout
   const remainingGlobal = GLOBAL_TIMEOUT_MS - (Date.now() - globalStartTime);

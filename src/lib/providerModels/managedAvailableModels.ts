@@ -1,6 +1,7 @@
 import {
   deleteModelAlias,
   getModelAliases,
+  getModelIsHidden,
   getProviderNodeById,
   setModelAlias,
 } from "@/lib/localDb";
@@ -34,7 +35,71 @@ async function getProviderDisplayPrefix(providerId: string): Promise<string> {
   return typeof prefix === "string" && prefix.trim().length > 0 ? prefix.trim() : providerId;
 }
 
-export async function syncManagedAvailableModelAliases(providerId: string, modelIds: string[]) {
+function normalizeModelIds(modelIds: string[]): string[] {
+  return Array.from(
+    new Set(
+      modelIds.map((modelId) => (typeof modelId === "string" ? modelId.trim() : "")).filter(Boolean)
+    )
+  );
+}
+
+function getManagedFullModelSet(providerId: string, modelIds: string[]): Set<string> {
+  const storagePrefix = getProviderStoragePrefix(providerId);
+  return new Set(normalizeModelIds(modelIds).map((modelId) => `${storagePrefix}/${modelId}`));
+}
+
+export async function deleteManagedAvailableModelAliases(
+  providerId: string,
+  modelIds: string[]
+): Promise<string[]> {
+  if (!usesManagedAvailableModels(providerId)) return [];
+
+  const targetFullModels = getManagedFullModelSet(providerId, modelIds);
+  if (targetFullModels.size === 0) return [];
+
+  const existingAliasesRaw = await getModelAliases();
+  const removedAliases: string[] = [];
+
+  for (const [alias, value] of Object.entries(existingAliasesRaw)) {
+    if (typeof value !== "string" || !targetFullModels.has(value)) continue;
+    await deleteModelAlias(alias);
+    removedAliases.push(alias);
+  }
+
+  return removedAliases;
+}
+
+export async function deleteManagedAvailableModelAliasesForProvider(
+  providerId: string
+): Promise<string[]> {
+  if (!usesManagedAvailableModels(providerId)) return [];
+
+  const storagePrefix = getProviderStoragePrefix(providerId);
+  const existingAliasesRaw = await getModelAliases();
+  const removedAliases: string[] = [];
+
+  for (const [alias, value] of Object.entries(existingAliasesRaw)) {
+    if (typeof value !== "string" || !value.startsWith(`${storagePrefix}/`)) continue;
+    await deleteModelAlias(alias);
+    removedAliases.push(alias);
+  }
+
+  return removedAliases;
+}
+
+export async function syncManagedAvailableModelAliases(
+  providerId: string,
+  modelIds: string[],
+  { pruneMissing = true }: { pruneMissing?: boolean } = {}
+) {
+  if (!usesManagedAvailableModels(providerId)) {
+    return {
+      assignedAliases: [],
+      removedAliases: [],
+      storagePrefix: getProviderStoragePrefix(providerId),
+    };
+  }
+
   const storagePrefix = getProviderStoragePrefix(providerId);
   const displayPrefix = await getProviderDisplayPrefix(providerId);
   const existingAliasesRaw = await getModelAliases();
@@ -45,26 +110,35 @@ export async function syncManagedAvailableModelAliases(providerId: string, model
     })
   );
 
-  const targetModelIds = Array.from(
-    new Set(
-      modelIds.map((modelId) => (typeof modelId === "string" ? modelId.trim() : "")).filter(Boolean)
-    )
-  );
+  const targetModelIds = normalizeModelIds(modelIds);
   const targetFullModels = new Set(targetModelIds.map((modelId) => `${storagePrefix}/${modelId}`));
   const removedAliases: string[] = [];
 
-  for (const [alias, value] of Object.entries(workingAliases)) {
-    if (!value.startsWith(`${storagePrefix}/`)) continue;
-    if (targetFullModels.has(value)) continue;
+  if (pruneMissing) {
+    for (const [alias, value] of Object.entries(workingAliases)) {
+      if (!value.startsWith(`${storagePrefix}/`)) continue;
+      if (targetFullModels.has(value)) continue;
 
-    await deleteModelAlias(alias);
-    delete workingAliases[alias];
-    removedAliases.push(alias);
+      await deleteModelAlias(alias);
+      delete workingAliases[alias];
+      removedAliases.push(alias);
+    }
   }
 
   const assignedAliases: string[] = [];
 
   for (const modelId of targetModelIds) {
+    if (getModelIsHidden(providerId, modelId)) {
+      const fullModel = `${storagePrefix}/${modelId}`;
+      for (const [alias, value] of Object.entries(workingAliases)) {
+        if (value !== fullModel) continue;
+        await deleteModelAlias(alias);
+        delete workingAliases[alias];
+        removedAliases.push(alias);
+      }
+      continue;
+    }
+
     const fullModel = `${storagePrefix}/${modelId}`;
     const alias = resolveManagedModelAlias({
       modelId,

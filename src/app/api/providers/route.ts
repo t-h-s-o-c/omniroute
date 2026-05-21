@@ -1,11 +1,16 @@
 import { NextResponse } from "next/server";
+import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance/index";
+import {
+  getProviderAuditTarget,
+  summarizeProviderConnectionForAudit,
+} from "@/lib/compliance/providerAudit";
 import {
   getProviderConnections,
   createProviderConnection,
+  deleteProviderConnections,
   getProviderNodeById,
   isCloudEnabled,
 } from "@/models";
-import { APIKEY_PROVIDERS } from "@/shared/constants/config";
 import {
   isClaudeCodeCompatibleProvider,
   isOpenAICompatibleProvider,
@@ -16,19 +21,33 @@ import { syncToCloud } from "@/lib/cloudSync";
 import { createProviderSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { normalizeQoderPatProviderData } from "@omniroute/open-sse/services/qoderCli";
+import {
+  normalizeProviderSpecificData,
+  sanitizeProviderSpecificDataForResponse,
+} from "@/lib/providers/requestDefaults";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { isManagedProviderConnectionId } from "@/lib/providers/catalog";
+import { isApiKeyRevealEnabled, maskStoredApiKey } from "@/lib/apiKeyExposure";
 
 // GET /api/providers - List all connections
-export async function GET() {
+export async function GET(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   try {
     const connections = await getProviderConnections();
+    const revealKeys = isApiKeyRevealEnabled();
 
-    // Hide sensitive fields
+    // Hide or mask sensitive fields
     const safeConnections = connections.map((c) => ({
       ...c,
-      apiKey: undefined,
+      apiKey: revealKeys ? c.apiKey : c.apiKey ? maskStoredApiKey(c.apiKey) : undefined,
       accessToken: undefined,
       refreshToken: undefined,
       idToken: undefined,
+      providerSpecificData: c.providerSpecificData
+        ? sanitizeProviderSpecificDataForResponse(c.providerSpecificData)
+        : undefined,
     }));
 
     return NextResponse.json({ connections: safeConnections });
@@ -40,6 +59,11 @@ export async function GET() {
 
 // POST /api/providers - Create new connection (API Key only, OAuth via separate flow)
 export async function POST(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
+  const auditContext = getAuditRequestContext(request);
+
   try {
     const body = await request.json();
 
@@ -61,8 +85,7 @@ export async function POST(request: Request) {
 
     // Business validation
     const isValidProvider =
-      APIKEY_PROVIDERS[provider] ||
-      provider === "qoder" ||
+      isManagedProviderConnectionId(provider) ||
       isOpenAICompatibleProvider(provider) ||
       isAnthropicCompatibleProvider(provider);
 
@@ -85,12 +108,7 @@ export async function POST(request: Request) {
       }
 
       const existingConnections = await getProviderConnections({ provider });
-      if (!allowMultipleCompatibleConnections && existingConnections.length > 0) {
-        return NextResponse.json(
-          { error: "Only one connection is allowed for this OpenAI Compatible node" },
-          { status: 400 }
-        );
-      }
+      // Allow multiple connections for compatible nodes exactly like first-party providers
 
       providerSpecificData = {
         ...(providerSpecificData || {}),
@@ -115,12 +133,7 @@ export async function POST(request: Request) {
       }
 
       const existingConnections = await getProviderConnections({ provider });
-      if (!allowMultipleCompatibleConnections && existingConnections.length > 0) {
-        return NextResponse.json(
-          { error: "Only one connection is allowed for this Anthropic Compatible node" },
-          { status: 400 }
-        );
-      }
+      // Allow multiple connections for compatible nodes exactly like first-party providers
 
       providerSpecificData = {
         ...(providerSpecificData || {}),
@@ -131,6 +144,8 @@ export async function POST(request: Request) {
         ...(node.modelsPath ? { modelsPath: node.modelsPath } : {}),
       };
     }
+
+    providerSpecificData = normalizeProviderSpecificData(provider, providerSpecificData) || null;
 
     const newConnection = await createProviderConnection({
       provider,
@@ -150,14 +165,85 @@ export async function POST(request: Request) {
     // Hide sensitive fields
     const result: Record<string, any> = { ...newConnection };
     delete result.apiKey;
+    if (result.providerSpecificData) {
+      result.providerSpecificData = sanitizeProviderSpecificDataForResponse(
+        result.providerSpecificData
+      );
+    }
 
     // Auto sync to Cloud if enabled
     await syncToCloudIfEnabled();
+
+    logAuditEvent({
+      action: "provider.credentials.created",
+      actor: "admin",
+      target: getProviderAuditTarget(newConnection),
+      resourceType: "provider_credentials",
+      status: "success",
+      ipAddress: auditContext.ipAddress || undefined,
+      requestId: auditContext.requestId,
+      metadata: {
+        provider: provider,
+        connection: summarizeProviderConnectionForAudit(newConnection),
+      },
+    });
 
     return NextResponse.json({ connection: result }, { status: 201 });
   } catch (error) {
     console.log("Error creating provider:", error);
     return NextResponse.json({ error: "Failed to create provider" }, { status: 500 });
+  }
+}
+
+export async function DELETE(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
+  const auditContext = getAuditRequestContext(request);
+
+  let body: { ids?: string[] };
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  if (!Array.isArray(body.ids) || body.ids.length === 0) {
+    return NextResponse.json(
+      { error: "ids must be a non-empty array of connection IDs" },
+      { status: 400 }
+    );
+  }
+
+  if (body.ids.length > 100) {
+    return NextResponse.json(
+      { error: "Cannot delete more than 100 connections at once" },
+      { status: 400 }
+    );
+  }
+
+  try {
+    const deleted = await deleteProviderConnections(body.ids);
+
+    await syncToCloudIfEnabled();
+
+    logAuditEvent({
+      action: "provider.credentials.batch_revoked",
+      actor: "admin",
+      resourceType: "provider_credentials",
+      status: "success",
+      ipAddress: auditContext.ipAddress || undefined,
+      requestId: auditContext.requestId,
+      metadata: { count: deleted, ids: body.ids },
+    });
+
+    return NextResponse.json(
+      { message: `Deleted ${deleted} connection(s)`, deleted },
+      { status: 200 }
+    );
+  } catch (error) {
+    console.log("Error batch deleting connections:", error);
+    return NextResponse.json({ error: "Failed to batch delete connections" }, { status: 500 });
   }
 }
 

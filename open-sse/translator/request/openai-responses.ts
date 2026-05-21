@@ -4,11 +4,13 @@
  * Responses API uses: { input: [...], instructions: "..." }
  * Chat API uses: { messages: [...] }
  */
-import { register } from "../registry.ts";
+import { isOpenAIResponsesStoreEnabled } from "@/lib/providers/requestDefaults";
 import { FORMATS } from "../formats.ts";
 import { generateToolCallId } from "../helpers/toolCallHelper.ts";
+import { register } from "../registry.ts";
 
 type JsonRecord = Record<string, unknown>;
+const RESPONSES_STORE_MARKER = "_omnirouteResponsesStore";
 
 function toRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
@@ -20,6 +22,11 @@ function toArray(value: unknown): unknown[] {
 
 function toString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
+}
+
+function normalizeResponsesReasoningEffort(value: unknown): string {
+  const effort = toString(value).toLowerCase();
+  return effort === "max" ? "xhigh" : effort;
 }
 
 function unsupportedFeature(message: string): Error & { statusCode: number; errorType: string } {
@@ -44,6 +51,8 @@ export function openaiResponsesToOpenAIRequest(
 
   const root = toRecord(body);
   if (root.input === undefined) return body;
+  const credentialRecord = toRecord(credentials);
+  const storeEnabled = isOpenAIResponsesStoreEnabled(credentialRecord.providerSpecificData);
 
   // Validate tool types — only function tools can be translated to Chat Completions
   const tools = toArray(root.tools);
@@ -51,8 +60,16 @@ export function openaiResponsesToOpenAIRequest(
     for (const toolValue of tools) {
       const tool = toRecord(toolValue);
       const toolType = toString(tool.type);
-      // Allow: function tools, and tools already in Chat format (have .function property)
-      if (toolType && toolType !== "function" && !tool.function) {
+      // Allow: function tools, tools already in Chat format (have .function property), CLI subagent tools,
+      // and namespace tools (MCP tool groups used by Codex/OpenAI Responses API).
+      if (
+        toolType &&
+        toolType !== "function" &&
+        toolType !== "custom" &&
+        toolType !== "command" &&
+        toolType !== "namespace" &&
+        !tool.function
+      ) {
         throw unsupportedFeature(
           `Unsupported Responses API feature: ${toolType} tool type is not supported by omniroute`
         );
@@ -60,13 +77,28 @@ export function openaiResponsesToOpenAIRequest(
     }
   }
 
-  if (root.background) {
-    throw unsupportedFeature(
-      "Unsupported Responses API feature: background mode is not supported by omniroute"
+  const result: JsonRecord = { ...root };
+
+  // background: true requests a deferred Responses API run (the upstream
+  // returns 202 with response_id and the client polls GET /responses/<id>).
+  // OmniRoute is a forward proxy that streams responses synchronously —
+  // implementing the queue/poll contract would require persistence and a
+  // separate retrieval surface. Degrade: log a marker when true was
+  // actually requested (operators can observe clients that should be
+  // reconfigured) and strip the flag. Clients that set background=true
+  // opportunistically (Capy Captain Pro, Codex agents) work unchanged.
+  // Clients that strictly require the async contract still observe a
+  // completed response on the first poll and can adapt.
+  if (result.background === true) {
+    const providerStr = toString(credentialRecord.provider);
+    const modelStr = toString(model);
+    console.warn(
+      `BACKGROUND_DEGRADE provider=${providerStr || "unknown"} model=${modelStr || "unknown"}`
     );
   }
-
-  const result: JsonRecord = { ...root };
+  if (result.background !== undefined) {
+    delete result.background;
+  }
   const messages: JsonRecord[] = [];
   result.messages = messages;
 
@@ -271,6 +303,9 @@ export function openaiResponsesToOpenAIRequest(
   delete result.input;
   delete result.instructions;
   delete result.include;
+  if (storeEnabled && root.store !== undefined) {
+    result[RESPONSES_STORE_MARKER] = root.store;
+  }
   delete result.store;
   delete result.reasoning;
 
@@ -287,15 +322,18 @@ export function openaiToOpenAIResponsesRequest(
   credentials: unknown
 ): unknown {
   void stream;
-  void credentials;
 
   const root = toRecord(body);
+  const credentialRecord = toRecord(credentials);
+  const storeEnabled = isOpenAIResponsesStoreEnabled(credentialRecord.providerSpecificData);
   const result: JsonRecord = {
     model,
     input: [],
     stream: true,
-    store: false,
   };
+  if (!storeEnabled) {
+    result.store = false;
+  }
 
   const input = result.input as JsonRecord[];
 
@@ -307,7 +345,7 @@ export function openaiToOpenAIResponsesRequest(
     const msg = toRecord(messageValue);
     const role = toString(msg.role);
 
-    if (role === "system") {
+    if (role === "system" || role === "developer") {
       if (!hasSystemMessage) {
         result.instructions = typeof msg.content === "string" ? msg.content : "";
         hasSystemMessage = true;
@@ -514,10 +552,52 @@ export function openaiToOpenAIResponsesRequest(
   }
 
   // Pass through relevant fields
+  if (root.previous_response_id !== undefined) {
+    result.previous_response_id = root.previous_response_id;
+  }
+  if (root.prompt_cache_key !== undefined) {
+    result.prompt_cache_key = root.prompt_cache_key;
+  }
+  if (root.session_id !== undefined) {
+    result.session_id = root.session_id;
+  }
+  if (root.conversation_id !== undefined) {
+    result.conversation_id = root.conversation_id;
+  }
   if (root.service_tier !== undefined) result.service_tier = root.service_tier;
   if (root.temperature !== undefined) result.temperature = root.temperature;
-  if (root.max_tokens !== undefined) result.max_tokens = root.max_tokens;
+  // Translate max_tokens / max_completion_tokens → max_output_tokens for Responses API.
+  // The Responses API does not accept max_tokens or max_completion_tokens; it requires
+  // max_output_tokens. max_completion_tokens takes priority as the newer Chat Completions field.
+  if (root.max_completion_tokens !== undefined) {
+    result.max_output_tokens = root.max_completion_tokens;
+  } else if (root.max_tokens !== undefined) {
+    result.max_output_tokens = root.max_tokens;
+  }
   if (root.top_p !== undefined) result.top_p = root.top_p;
+  if (root.reasoning !== undefined) {
+    result.reasoning = root.reasoning;
+  } else if (root.reasoning_effort !== undefined) {
+    const effort = normalizeResponsesReasoningEffort(root.reasoning_effort);
+    if (effort) {
+      result.reasoning = { effort };
+    }
+  }
+
+  // Propagate Responses-API-only fields when a chat client sent them.
+  // Without this, e.g. `include: ["reasoning.encrypted_content"]` is lost on
+  // the way upstream and Codex returns an empty reasoning summary, so clients
+  // (OpenCode, Cursor, etc.) see no thinking stream.
+  if (Array.isArray(root.include) && root.include.length > 0) {
+    result.include = root.include;
+  }
+  if (storeEnabled) {
+    if (root[RESPONSES_STORE_MARKER] !== undefined) {
+      result.store = root[RESPONSES_STORE_MARKER];
+    } else if (root.store !== undefined) {
+      result.store = root.store;
+    }
+  }
 
   return result;
 }

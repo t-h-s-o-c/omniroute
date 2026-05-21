@@ -1,3 +1,5 @@
+import { isDeepSeekReasoningModel } from "../../services/reasoningCache.ts";
+
 /**
  * Shared sanitizers for tool payloads that arrive from IDEs/SDKs with
  * JSON Schema numeric constraints encoded as strings or invalid descriptions.
@@ -51,6 +53,11 @@ export function coerceSchemaNumericFields(schema: unknown): unknown {
   if (!isPlainObject(schema)) return schema;
 
   const result: JsonRecord = { ...schema };
+
+  // Fix #1782: Strip 'default' property to prevent upstream models from eagerly injecting optional fields
+  if ("default" in result) {
+    delete result.default;
+  }
 
   for (const field of NUMERIC_SCHEMA_FIELDS) {
     if (field in result) {
@@ -191,9 +198,17 @@ export function sanitizeToolId(id: string | undefined): string {
 
 export function injectEmptyReasoningContentForToolCalls(
   messages: unknown,
-  provider: unknown
+  provider: unknown,
+  model: unknown
 ): unknown {
-  if (!Array.isArray(messages) || String(provider || "").toLowerCase() !== "deepseek") {
+  if (
+    !Array.isArray(messages) ||
+    !isDeepSeekReasoningModel({
+      provider: String(provider ?? ""),
+      model: String(model ?? ""),
+      thinkingEnabled: true,
+    })
+  ) {
     return messages;
   }
 

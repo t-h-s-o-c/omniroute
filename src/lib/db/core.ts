@@ -4,15 +4,54 @@
  * All domain modules import `getDbInstance` and helpers from here.
  */
 
-import Database from "better-sqlite3";
+import type { SqliteAdapter } from "./adapters/types";
+import {
+  tryOpenSync,
+  getSqlJsAdapter,
+  preInitSqlJs,
+  openDatabaseAsync,
+} from "./adapters/driverFactory";
 import path from "path";
 import fs from "fs";
 import { resolveDataDir, getLegacyDotDataDir } from "../dataPaths";
 import { runMigrations } from "./migrationRunner";
+import { runDbHealthCheck } from "./healthCheck";
+import { parseStoredPayload } from "../logPayloads";
+import {
+  buildArtifactRelativePath,
+  writeCallArtifact,
+  type CallLogArtifact,
+} from "../usage/callLogArtifacts";
+import { migrateLegacyEncryptedString } from "./encryption";
+import { invalidateDbCache } from "./readCache";
 
-type SqliteDatabase = import("better-sqlite3").Database;
+type SqliteDatabase = SqliteAdapter;
 type JsonRecord = Record<string, unknown>;
 type CheckpointMode = "PASSIVE" | "FULL" | "RESTART" | "TRUNCATE";
+type PreservedTableSnapshot = {
+  table: string;
+  rowCount: number;
+  maxRows: number;
+  columns: string[];
+  rows: JsonRecord[];
+};
+type SkippedTableSnapshot = {
+  table: string;
+  rowCount: number;
+  maxRows: number;
+  reason: string;
+};
+type PreservedCriticalDbState = {
+  captureSucceeded: boolean;
+  captureError: string | null;
+  preservedTables: PreservedTableSnapshot[];
+  skippedTables: SkippedTableSnapshot[];
+};
+type CriticalTableSpec = {
+  table: string;
+  maxRows?: number;
+  readRows?: (db: SqliteDatabase) => JsonRecord[];
+};
 
 // ──────────────── Environment Detection ────────────────
 
@@ -27,6 +66,77 @@ const LEGACY_DATA_DIR = isCloud ? null : getLegacyDotDataDir();
 export const SQLITE_FILE = isCloud ? null : path.join(DATA_DIR, "storage.sqlite");
 const JSON_DB_FILE = isCloud ? null : path.join(DATA_DIR, "db.json");
 export const DB_BACKUPS_DIR = isCloud ? null : path.join(DATA_DIR, "db_backups");
+const DEFAULT_CRITICAL_TABLE_ROW_LIMIT = 10_000;
+const SKIP_PRESERVE_NAMESPACES = new Set([
+  "syncedAvailableModels",
+  "providerLimitsCache",
+  "lkgp",
+  "gemini_thought_signatures",
+]);
+const CRITICAL_DB_TABLES: CriticalTableSpec[] = [
+  {
+    table: "key_value",
+    maxRows: 10_000,
+    readRows(db) {
+      return (
+        (db.prepare("SELECT namespace, key, value FROM key_value").all() as JsonRecord[]) ?? []
+      ).filter(
+        (row) => typeof row.namespace !== "string" || !SKIP_PRESERVE_NAMESPACES.has(row.namespace)
+      );
+    },
+  },
+  { table: "provider_connections", maxRows: 5_000 },
+  { table: "provider_nodes", maxRows: 5_000 },
+  { table: "combos", maxRows: 5_000 },
+  { table: "api_keys", maxRows: 5_000 },
+  { table: "proxy_registry", maxRows: 5_000 },
+  { table: "proxy_assignments", maxRows: 10_000 },
+  { table: "model_combo_mappings", maxRows: 5_000 },
+  { table: "sync_tokens", maxRows: 5_000 },
+  { table: "registered_keys", maxRows: 10_000 },
+  { table: "provider_key_limits", maxRows: 10_000 },
+  { table: "account_key_limits", maxRows: 10_000 },
+  { table: "upstream_proxy_config", maxRows: 5_000 },
+  { table: "webhooks", maxRows: 5_000 },
+];
+
+export function isNativeSqliteLoadError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = getErrorCode(error);
+  return (
+    message.includes("Module did not self-register") ||
+    message.includes("NODE_MODULE_VERSION") ||
+    message.includes("ERR_DLOPEN_FAILED") ||
+    // bun and similar runtimes that skip the postinstall script never download
+    // the prebuilt *.node binary, so `bindings()` fails with this message
+    // before any DLOPEN even happens (#2358).
+    message.includes("Could not locate the bindings file") ||
+    message.includes("Cannot find module 'better-sqlite3'") ||
+    code === "ERR_DLOPEN_FAILED" ||
+    code === "MODULE_NOT_FOUND"
+  );
+}
+
+function getErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+function openSqliteDatabase(sqliteFile: string, options?: Record<string, unknown>): SqliteDatabase {
+  const adapter = tryOpenSync(sqliteFile, options);
+  if (adapter) return adapter;
+
+  const sqlJs = getSqlJsAdapter(sqliteFile);
+  if (sqlJs) return sqlJs;
+
+  throw new Error(
+    `[DB] Nenhum driver SQLite disponível para '${sqliteFile}'. ` +
+      "Chame ensureDbInitialized() no startup. " +
+      "Drivers testados: better-sqlite3 (falhou), node:sqlite (indisponível). " +
+      "sql.js WASM ainda não foi pré-inicializado."
+  );
+}
 
 // Ensure data directory exists — with fallback for restricted home directories (#133)
 if (!isCloud && !fs.existsSync(DATA_DIR)) {
@@ -82,6 +192,8 @@ const SCHEMA_SQL = `
     rate_limit_protection INTEGER DEFAULT 0,
     last_used_at TEXT,
     "group" TEXT,
+    max_concurrent INTEGER,
+    quota_window_thresholds_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -144,6 +256,7 @@ const SCHEMA_SQL = `
     tokens_cache_read INTEGER DEFAULT 0,
     tokens_cache_creation INTEGER DEFAULT 0,
     tokens_reasoning INTEGER DEFAULT 0,
+    service_tier TEXT DEFAULT 'standard',
     status TEXT,
     success INTEGER DEFAULT 1,
     latency_ms INTEGER DEFAULT 0,
@@ -162,22 +275,35 @@ const SCHEMA_SQL = `
     path TEXT,
     status INTEGER,
     model TEXT,
+    requested_model TEXT,
     provider TEXT,
     account TEXT,
     connection_id TEXT,
     duration INTEGER DEFAULT 0,
     tokens_in INTEGER DEFAULT 0,
     tokens_out INTEGER DEFAULT 0,
+    tokens_cache_read INTEGER DEFAULT NULL,
+    tokens_cache_creation INTEGER DEFAULT NULL,
+    tokens_reasoning INTEGER DEFAULT NULL,
+    tokens_compressed INTEGER DEFAULT NULL,
+    cache_source TEXT DEFAULT "upstream",
+    request_type TEXT,
     source_format TEXT,
     target_format TEXT,
     api_key_id TEXT,
     api_key_name TEXT,
     combo_name TEXT,
-    request_body TEXT,
-    response_body TEXT,
-    error TEXT,
+    combo_step_id TEXT,
+    combo_execution_key TEXT,
+    error_summary TEXT,
+    detail_state TEXT DEFAULT 'none',
     artifact_relpath TEXT,
-    has_pipeline_details INTEGER DEFAULT 0
+    artifact_size_bytes INTEGER DEFAULT NULL,
+    artifact_sha256 TEXT DEFAULT NULL,
+    has_request_body INTEGER DEFAULT 0,
+    has_response_body INTEGER DEFAULT 0,
+    has_pipeline_details INTEGER DEFAULT 0,
+    request_summary TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_cl_timestamp ON call_logs(timestamp);
   CREATE INDEX IF NOT EXISTS idx_cl_status ON call_logs(status);
@@ -214,9 +340,28 @@ const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS domain_budgets (
     api_key_id TEXT PRIMARY KEY,
     daily_limit_usd REAL NOT NULL,
+    weekly_limit_usd REAL DEFAULT 0,
     monthly_limit_usd REAL DEFAULT 0,
-    warning_threshold REAL DEFAULT 0.8
+    warning_threshold REAL DEFAULT 0.8,
+    reset_interval TEXT DEFAULT 'daily',
+    reset_time TEXT DEFAULT '00:00',
+    budget_reset_at INTEGER,
+    last_budget_reset_at INTEGER,
+    warning_emitted_at INTEGER,
+    warning_period_start INTEGER
   );
+
+  CREATE TABLE IF NOT EXISTS domain_budget_reset_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    api_key_id TEXT NOT NULL,
+    reset_interval TEXT NOT NULL,
+    previous_spend REAL NOT NULL DEFAULT 0,
+    reset_at INTEGER NOT NULL,
+    next_reset_at INTEGER NOT NULL,
+    period_start INTEGER NOT NULL,
+    period_end INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_dbrl_key_reset ON domain_budget_reset_logs(api_key_id, reset_at DESC);
 
   CREATE TABLE IF NOT EXISTS domain_cost_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -254,6 +399,22 @@ const SCHEMA_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_sc_sig ON semantic_cache(signature);
   CREATE INDEX IF NOT EXISTS idx_sc_model ON semantic_cache(model);
+
+  CREATE TABLE IF NOT EXISTS quota_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    window_key TEXT NOT NULL,
+    remaining_percentage REAL,
+    is_exhausted INTEGER DEFAULT 0,
+    next_reset_at TEXT,
+    window_duration_ms INTEGER,
+    raw_data TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_quota_snapshots_provider_time ON quota_snapshots(provider, created_at);
+  CREATE INDEX IF NOT EXISTS idx_quota_snapshots_connection_time ON quota_snapshots(connection_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_quota_snapshots_created_at ON quota_snapshots(created_at);
 `;
 
 // ──────────────── Column Mapping ────────────────
@@ -288,6 +449,16 @@ export function rowToCamel(row: unknown): JsonRecord | null {
       } catch {
         result[camelKey] = v;
       }
+    } else if (camelKey.endsWith("Json") && typeof v === "string") {
+      // Convention: any column with a `_json` suffix is JSON-encoded TEXT.
+      // Surface the parsed object under the friendlier name (key minus the
+      // "Json" suffix) — e.g. quotaWindowThresholdsJson → quotaWindowThresholds.
+      const baseKey = camelKey.slice(0, -"Json".length);
+      try {
+        result[baseKey] = JSON.parse(v);
+      } catch {
+        result[baseKey] = null;
+      }
     } else {
       result[camelKey] = v;
     }
@@ -310,7 +481,7 @@ export function cleanNulls(obj: unknown): JsonRecord {
 // Module-level `let` resets on every webpack recompile, causing connection leaks.
 
 declare global {
-  var __omnirouteDb: import("better-sqlite3").Database | undefined;
+  var __omnirouteDb: SqliteAdapter | undefined;
 }
 
 function getDb(): SqliteDatabase | null {
@@ -351,6 +522,17 @@ function ensureProviderConnectionsColumns(db: SqliteDatabase) {
       db.exec('ALTER TABLE provider_connections ADD COLUMN "group" TEXT');
       console.log('[DB] Added provider_connections."group" column');
     }
+    if (!columnNames.has("max_concurrent")) {
+      db.exec("ALTER TABLE provider_connections ADD COLUMN max_concurrent INTEGER");
+      console.log("[DB] Added provider_connections.max_concurrent column");
+    }
+    if (!columnNames.has("quota_window_thresholds_json")) {
+      db.exec("ALTER TABLE provider_connections ADD COLUMN quota_window_thresholds_json TEXT");
+      console.log("[DB] Added provider_connections.quota_window_thresholds_json column");
+    }
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_pc_max_concurrent ON provider_connections(provider, max_concurrent)"
+    );
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn("[DB] Failed to verify provider_connections schema:", message);
@@ -380,6 +562,11 @@ function ensureUsageHistoryColumns(db: SqliteDatabase) {
       db.exec("ALTER TABLE usage_history ADD COLUMN error_code TEXT");
       console.log("[DB] Added usage_history.error_code column");
     }
+    if (!columnNames.has("service_tier")) {
+      db.exec("ALTER TABLE usage_history ADD COLUMN service_tier TEXT DEFAULT 'standard'");
+      console.log("[DB] Added usage_history.service_tier column");
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS idx_uh_service_tier ON usage_history(service_tier)");
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn("[DB] Failed to verify usage_history schema:", message);
@@ -401,6 +588,74 @@ function ensureCallLogsColumns(db: SqliteDatabase) {
       db.exec("ALTER TABLE call_logs ADD COLUMN has_pipeline_details INTEGER DEFAULT 0");
       console.log("[DB] Added call_logs.has_pipeline_details column");
     }
+    if (!columnNames.has("requested_model")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN requested_model TEXT DEFAULT NULL");
+      console.log("[DB] Added call_logs.requested_model column");
+    }
+    if (!columnNames.has("request_type")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN request_type TEXT DEFAULT NULL");
+      console.log("[DB] Added call_logs.request_type column");
+    }
+    if (!columnNames.has("tokens_cache_read")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN tokens_cache_read INTEGER DEFAULT NULL");
+      console.log("[DB] Added call_logs.tokens_cache_read column");
+    }
+    if (!columnNames.has("tokens_cache_creation")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN tokens_cache_creation INTEGER DEFAULT NULL");
+      console.log("[DB] Added call_logs.tokens_cache_creation column");
+    }
+    if (!columnNames.has("tokens_reasoning")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN tokens_reasoning INTEGER DEFAULT NULL");
+      console.log("[DB] Added call_logs.tokens_reasoning column");
+    }
+    if (!columnNames.has("cache_source")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN cache_source TEXT DEFAULT 'upstream'");
+      console.log("[DB] Added call_logs.cache_source column");
+    }
+    if (!columnNames.has("combo_step_id")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN combo_step_id TEXT DEFAULT NULL");
+      console.log("[DB] Added call_logs.combo_step_id column");
+    }
+    if (!columnNames.has("combo_execution_key")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN combo_execution_key TEXT DEFAULT NULL");
+      console.log("[DB] Added call_logs.combo_execution_key column");
+    }
+    if (!columnNames.has("error_summary")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN error_summary TEXT DEFAULT NULL");
+      console.log("[DB] Added call_logs.error_summary column");
+    }
+    if (!columnNames.has("detail_state")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN detail_state TEXT DEFAULT 'none'");
+      console.log("[DB] Added call_logs.detail_state column");
+    }
+    if (!columnNames.has("artifact_size_bytes")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN artifact_size_bytes INTEGER DEFAULT NULL");
+      console.log("[DB] Added call_logs.artifact_size_bytes column");
+    }
+    if (!columnNames.has("artifact_sha256")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN artifact_sha256 TEXT DEFAULT NULL");
+      console.log("[DB] Added call_logs.artifact_sha256 column");
+    }
+    if (!columnNames.has("has_request_body")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN has_request_body INTEGER DEFAULT 0");
+      console.log("[DB] Added call_logs.has_request_body column");
+    }
+    if (!columnNames.has("has_response_body")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN has_response_body INTEGER DEFAULT 0");
+      console.log("[DB] Added call_logs.has_response_body column");
+    }
+    if (!columnNames.has("request_summary")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN request_summary TEXT DEFAULT NULL");
+      console.log("[DB] Added call_logs.request_summary column");
+    }
+
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_call_logs_requested_model ON call_logs(requested_model)"
+    );
+    db.exec("CREATE INDEX IF NOT EXISTS idx_call_logs_request_type ON call_logs(request_type)");
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_cl_combo_target ON call_logs(combo_name, combo_execution_key, timestamp)"
+    );
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn("[DB] Failed to verify call_logs schema:", message);
@@ -412,6 +667,468 @@ function hasColumn(db: SqliteDatabase, tableName: string, columnName: string): b
   return rows.some((row) => row.name === columnName);
 }
 
+function hasTable(db: SqliteDatabase, tableName: string): boolean {
+  return Boolean(
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName)
+  );
+}
+
+function quoteIdentifier(identifier: string): string {
+  return `"${identifier.replace(/"/g, '""')}"`;
+}
+
+function getTableColumns(db: SqliteDatabase, tableName: string): string[] {
+  return (
+    db.prepare(`PRAGMA table_info(${quoteIdentifier(tableName)})`).all() as Array<{ name?: string }>
+  )
+    .map((column) => String(column.name ?? ""))
+    .filter((column) => column.length > 0);
+}
+
+function summarizePreservedTables(tables: PreservedTableSnapshot[]): string {
+  if (tables.length === 0) return "none";
+  return tables.map((table) => `${table.table}(${table.rowCount})`).join(", ");
+}
+
+function summarizeSkippedTables(tables: SkippedTableSnapshot[]): string {
+  if (tables.length === 0) return "none";
+  return tables
+    .map((table) => `${table.table}(${table.rowCount}/${table.maxRows}: ${table.reason})`)
+    .join(", ");
+}
+
+function listProbeFailureBackups(sqliteFile: string): string[] {
+  const directory = path.dirname(sqliteFile);
+  const baseName = path.basename(sqliteFile);
+  const prefix = `${baseName}.probe-failed-`;
+  if (!fs.existsSync(directory)) return [];
+
+  return fs
+    .readdirSync(directory)
+    .filter((name) => name.startsWith(prefix))
+    .map((name) => ({
+      path: path.join(directory, name),
+      timestamp: Number(name.slice(prefix.length)),
+    }))
+    .sort((left, right) => {
+      const leftTimestamp = Number.isFinite(left.timestamp) ? left.timestamp : 0;
+      const rightTimestamp = Number.isFinite(right.timestamp) ? right.timestamp : 0;
+      return rightTimestamp - leftTimestamp || right.path.localeCompare(left.path);
+    })
+    .map((backup) => backup.path);
+}
+
+function captureCriticalDbState(sqliteFile: string): PreservedCriticalDbState {
+  const snapshot: PreservedCriticalDbState = {
+    captureSucceeded: false,
+    captureError: null,
+    preservedTables: [],
+    skippedTables: [],
+  };
+
+  if (!fs.existsSync(sqliteFile)) {
+    snapshot.captureSucceeded = true;
+    return snapshot;
+  }
+
+  let probe: SqliteDatabase | null = null;
+  try {
+    probe = openSqliteDatabase(sqliteFile, { readonly: true });
+
+    for (const tableSpec of CRITICAL_DB_TABLES) {
+      if (!hasTable(probe, tableSpec.table)) continue;
+
+      const maxRows = tableSpec.maxRows ?? DEFAULT_CRITICAL_TABLE_ROW_LIMIT;
+      const rows = (tableSpec.readRows?.(probe) ??
+        (probe
+          .prepare(`SELECT * FROM ${quoteIdentifier(tableSpec.table)}`)
+          .all() as JsonRecord[])) as JsonRecord[];
+      const rowCount = rows.length;
+
+      if (rowCount === 0) continue;
+
+      if (rowCount > maxRows) {
+        snapshot.skippedTables.push({
+          table: tableSpec.table,
+          rowCount,
+          maxRows,
+          reason: "row_limit_exceeded",
+        });
+        continue;
+      }
+
+      snapshot.preservedTables.push({
+        table: tableSpec.table,
+        rowCount,
+        maxRows,
+        columns: getTableColumns(probe, tableSpec.table),
+        rows,
+      });
+    }
+
+    snapshot.captureSucceeded = true;
+    return snapshot;
+  } catch (error: unknown) {
+    snapshot.captureError = error instanceof Error ? error.message : String(error);
+    return snapshot;
+  } finally {
+    try {
+      probe?.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function restoreCriticalDbState(
+  db: SqliteDatabase,
+  snapshot: PreservedCriticalDbState
+): PreservedTableSnapshot[] {
+  const restoredTables: PreservedTableSnapshot[] = [];
+
+  const restore = db.transaction(() => {
+    for (const table of snapshot.preservedTables) {
+      if (table.rows.length === 0) continue;
+      if (!hasTable(db, table.table)) {
+        throw new Error(`Current schema is missing preserved table "${table.table}"`);
+      }
+
+      const currentColumns = new Set(getTableColumns(db, table.table));
+      const restoreColumns = table.columns.filter((column) => currentColumns.has(column));
+      if (restoreColumns.length === 0) {
+        throw new Error(`No compatible columns remain for preserved table "${table.table}"`);
+      }
+
+      const sql = `INSERT OR REPLACE INTO ${quoteIdentifier(table.table)} (${restoreColumns
+        .map((column) => quoteIdentifier(column))
+        .join(", ")}) VALUES (${restoreColumns.map(() => "?").join(", ")})`;
+      const insert = db.prepare(sql);
+
+      for (const row of table.rows) {
+        insert.run(...restoreColumns.map((column) => row[column] ?? null));
+      }
+
+      restoredTables.push(table);
+    }
+  });
+
+  restore();
+  return restoredTables;
+}
+
+function cleanupRecreatedSqliteFiles(sqliteFile: string) {
+  for (const filePath of [
+    sqliteFile,
+    `${sqliteFile}-wal`,
+    `${sqliteFile}-shm`,
+    `${sqliteFile}-journal`,
+  ]) {
+    try {
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function parseLegacyError(value: unknown): unknown {
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function offloadLegacyCallLogDetails(db: SqliteDatabase) {
+  if (!hasTable(db, "call_logs_v1_legacy")) return;
+
+  type LegacyCallLogRow = {
+    id: string;
+    timestamp: string | null;
+    method: string | null;
+    path: string | null;
+    status: number | null;
+    model: string | null;
+    requested_model: string | null;
+    provider: string | null;
+    account: string | null;
+    connection_id: string | null;
+    duration: number | null;
+    tokens_in: number | null;
+    tokens_out: number | null;
+    tokens_cache_read: number | null;
+    tokens_cache_creation: number | null;
+    tokens_reasoning: number | null;
+    tokens_compressed: number | null;
+    request_type: string | null;
+    source_format: string | null;
+    target_format: string | null;
+    api_key_id: string | null;
+    api_key_name: string | null;
+    combo_name: string | null;
+    combo_step_id: string | null;
+    combo_execution_key: string | null;
+    request_body: string | null;
+    response_body: string | null;
+    error: string | null;
+  };
+
+  const pendingRows = db
+    .prepare(
+      `
+      SELECT legacy.*
+      FROM call_logs_v1_legacy AS legacy
+      JOIN call_logs AS current ON current.id = legacy.id
+      WHERE current.detail_state = 'legacy-inline'
+      ORDER BY legacy.timestamp ASC
+    `
+    )
+    .all() as LegacyCallLogRow[];
+
+  if (pendingRows.length === 0) {
+    db.exec("DROP TABLE IF EXISTS call_logs_v1_legacy");
+    return;
+  }
+
+  const updateStmt = db.prepare(`
+    UPDATE call_logs
+    SET artifact_relpath = @artifactRelPath,
+        artifact_size_bytes = @artifactSizeBytes,
+        artifact_sha256 = @artifactSha256,
+        detail_state = 'ready'
+    WHERE id = @id
+  `);
+  const markMissingStmt = db.prepare(`
+    UPDATE call_logs
+    SET detail_state = 'missing',
+        artifact_relpath = NULL,
+        artifact_size_bytes = NULL,
+        artifact_sha256 = NULL
+    WHERE id = ?
+  `);
+
+  let failed = 0;
+  const tx = db.transaction(() => {
+    for (const row of pendingRows) {
+      const artifact: CallLogArtifact = {
+        schemaVersion: 5,
+        summary: {
+          id: row.id,
+          timestamp: row.timestamp || new Date().toISOString(),
+          method: row.method || "POST",
+          path: row.path || "/v1/chat/completions",
+          status: row.status || 0,
+          model: row.model || "-",
+          requestedModel: row.requested_model || null,
+          provider: row.provider || "-",
+          account: row.account || "-",
+          connectionId: row.connection_id || null,
+          duration: row.duration || 0,
+          tokens: {
+            in: row.tokens_in || 0,
+            out: row.tokens_out || 0,
+            cacheRead: row.tokens_cache_read ?? null,
+            cacheWrite: row.tokens_cache_creation ?? null,
+            reasoning: row.tokens_reasoning ?? null,
+            compressed: row.tokens_compressed ?? null,
+          },
+          requestType: row.request_type || null,
+          sourceFormat: row.source_format || null,
+          targetFormat: row.target_format || null,
+          apiKeyId: row.api_key_id || null,
+          apiKeyName: row.api_key_name || null,
+          comboName: row.combo_name || null,
+          comboStepId: row.combo_step_id || null,
+          comboExecutionKey: row.combo_execution_key || null,
+        },
+        requestBody: parseStoredPayload(row.request_body),
+        responseBody: parseStoredPayload(row.response_body),
+        error: parseLegacyError(row.error),
+      };
+
+      const artifactResult = writeCallArtifact(
+        artifact,
+        buildArtifactRelativePath(artifact.summary.timestamp, artifact.summary.id)
+      );
+      if (!artifactResult) {
+        failed++;
+        markMissingStmt.run(row.id);
+        continue;
+      }
+
+      updateStmt.run({
+        id: row.id,
+        artifactRelPath: artifactResult.relPath,
+        artifactSizeBytes: artifactResult.sizeBytes,
+        artifactSha256: artifactResult.sha256,
+      });
+    }
+  });
+
+  tx();
+
+  if (failed > 0) {
+    console.warn(
+      `[DB] Kept call_logs_v1_legacy after partial call log offload (${failed} failed row(s)).`
+    );
+    return;
+  }
+
+  db.exec("DROP TABLE IF EXISTS call_logs_v1_legacy");
+  try {
+    db.pragma("wal_checkpoint(TRUNCATE)");
+    db.exec("VACUUM");
+    console.log(`[DB] Offloaded ${pendingRows.length} legacy call log detail row(s) to artifacts.`);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn("[DB] Legacy call log compaction finished without VACUUM:", message);
+  }
+}
+
+function isAutomatedTestProcess(): boolean {
+  return (
+    typeof process !== "undefined" &&
+    (process.env.NODE_ENV === "test" ||
+      process.env.VITEST !== undefined ||
+      process.argv.some((arg) => arg.includes("test")))
+  );
+}
+
+function shouldRunStartupDbHealthCheck(): boolean {
+  if (process.env.OMNIROUTE_FORCE_DB_HEALTHCHECK === "1") return true;
+  return !isAutomatedTestProcess();
+}
+
+function createManagedDbBackup(db: SqliteDatabase, reason: string): boolean {
+  const isTest = isAutomatedTestProcess();
+  if (isTest) return false;
+
+  try {
+    const backupDir = DB_BACKUPS_DIR || path.join(DATA_DIR, "db_backups");
+    if (!fs.existsSync(backupDir)) {
+      fs.mkdirSync(backupDir, { recursive: true });
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupPath = path.join(backupDir, `db_${timestamp}_${reason}.sqlite`);
+    const escapedBackupPath = backupPath.replace(/'/g, "''");
+
+    db.exec(`VACUUM INTO '${escapedBackupPath}'`);
+    console.log(`[DB] Backup created (${reason}): ${backupPath}`);
+    return true;
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[DB] Failed to create ${reason} backup:`, message);
+    return false;
+  }
+}
+
+function createHealthCheckBackup(db: SqliteDatabase): boolean {
+  return createManagedDbBackup(db, "health-check-repair");
+}
+
+function autoMigrateLegacyEncryptedConnections(db: SqliteDatabase): number {
+  const rows = db.prepare("SELECT * FROM provider_connections").all() as JsonRecord[];
+  const updateStmt = db.prepare(
+    "UPDATE provider_connections SET api_key = @apiKey, id_token = @idToken, access_token = @accessToken, refresh_token = @refreshToken, updated_at = @updatedAt WHERE id = @id"
+  );
+  const encryptedFields = ["apiKey", "idToken", "accessToken", "refreshToken"] as const;
+  let migratedCount = 0;
+  let backupCreated = false;
+
+  for (const row of rows) {
+    const camelRow = rowToCamel(row);
+    if (!camelRow) continue;
+
+    let updatedRow = false;
+    for (const field of encryptedFields) {
+      if (typeof camelRow[field] !== "string") continue;
+
+      const { updated, value } = migrateLegacyEncryptedString(camelRow[field]);
+      if (updated) {
+        camelRow[field] = value;
+        updatedRow = true;
+      }
+    }
+
+    if (!updatedRow) continue;
+    if (!backupCreated) {
+      createManagedDbBackup(db, "legacy-encryption-migration");
+      backupCreated = true;
+    }
+
+    updateStmt.run({
+      id: camelRow.id,
+      apiKey: camelRow.apiKey ?? null,
+      idToken: camelRow.idToken ?? null,
+      accessToken: camelRow.accessToken ?? null,
+      refreshToken: camelRow.refreshToken ?? null,
+      updatedAt: new Date().toISOString(),
+    });
+    migratedCount++;
+  }
+
+  if (migratedCount > 0) {
+    invalidateDbCache("connections");
+    console.log(`[DB] Auto-migrated ${migratedCount} connection(s) to new static-salt encryption.`);
+  }
+
+  return migratedCount;
+}
+
+let dbHealthCheckTimer: NodeJS.Timeout | null = null;
+
+function getDbHealthCheckIntervalMs(): number {
+  const rawValue = process.env.OMNIROUTE_DB_HEALTHCHECK_INTERVAL_MS;
+  if (typeof rawValue === "string" && rawValue.trim().length > 0) {
+    const parsed = Number(rawValue);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+  return 6 * 60 * 60 * 1000;
+}
+
+function clearDbHealthCheckScheduler() {
+  if (dbHealthCheckTimer) {
+    clearInterval(dbHealthCheckTimer);
+    dbHealthCheckTimer = null;
+  }
+}
+
+function startDbHealthCheckScheduler(db: SqliteDatabase) {
+  clearDbHealthCheckScheduler();
+  if (isCloud || isBuildPhase || isAutomatedTestProcess()) return;
+
+  const intervalMs = getDbHealthCheckIntervalMs();
+  if (intervalMs <= 0) return;
+
+  dbHealthCheckTimer = setInterval(() => {
+    try {
+      if (!db.open) return;
+      runDbHealthCheck(db, {
+        autoRepair: true,
+        expectedSchemaVersion: "1",
+        createBackupBeforeRepair: () => createHealthCheckBackup(db),
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn("[DB] Periodic health-check failed:", message);
+    }
+  }, intervalMs);
+  dbHealthCheckTimer.unref?.();
+}
+
+export function runManagedDbHealthCheck(options?: { autoRepair?: boolean }) {
+  const db = getDbInstance();
+  return runDbHealthCheck(db, {
+    autoRepair: options?.autoRepair === true,
+    expectedSchemaVersion: "1",
+    createBackupBeforeRepair: () => createHealthCheckBackup(db),
+  });
+}
+
 export function getDbInstance(): SqliteDatabase {
   const existing = getDb();
   if (existing) return existing;
@@ -420,10 +1137,12 @@ export function getDbInstance(): SqliteDatabase {
     if (isBuildPhase) {
       console.log("[DB] Build phase detected — using in-memory SQLite (read-only)");
     }
-    const memoryDb = new Database(":memory:");
+    const memoryDb = openSqliteDatabase(":memory:");
     memoryDb.pragma("journal_mode = WAL");
     memoryDb.exec(SCHEMA_SQL);
     ensureUsageHistoryColumns(memoryDb);
+    ensureCallLogsColumns(memoryDb);
+    ensureProviderConnectionsColumns(memoryDb);
     setDb(memoryDb);
     return memoryDb;
   }
@@ -433,12 +1152,68 @@ export function getDbInstance(): SqliteDatabase {
     throw new Error("SQLITE_FILE is unavailable for local mode");
   }
   const jsonDbFile = JSON_DB_FILE;
+  const probeFailureBackups = listProbeFailureBackups(sqliteFile);
+  if (!fs.existsSync(sqliteFile) && probeFailureBackups.length > 0) {
+    const latestBackup = probeFailureBackups[0];
+    try {
+      fs.renameSync(latestBackup, sqliteFile);
+      console.log(
+        `[DB] Auto-restored preserved database from previous probe failure: ${path.basename(latestBackup)}`
+      );
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `[DB] Manual recovery required before startup. ` +
+          `Failed to auto-restore preserved database ${latestBackup}: ${msg}. ` +
+          `Restore the preserved file or another backup to ${sqliteFile} before restarting.`
+      );
+    }
+  }
+
+  let preservedCriticalState: PreservedCriticalDbState = {
+    captureSucceeded: true,
+    captureError: null,
+    preservedTables: [],
+    skippedTables: [],
+  };
+  let failedProbePath: string | null = null;
+  let failedProbeMessage: string | null = null;
+
+  if (fs.existsSync(sqliteFile)) {
+    preservedCriticalState = captureCriticalDbState(sqliteFile);
+    if (preservedCriticalState.captureSucceeded) {
+      if (preservedCriticalState.preservedTables.length > 0) {
+        console.log(
+          `[DB] Preserved critical DB state before potential recreation: ${summarizePreservedTables(
+            preservedCriticalState.preservedTables
+          )}`
+        );
+      }
+      if (preservedCriticalState.skippedTables.length > 0) {
+        console.warn(
+          `[DB] Critical DB tables skipped during preservation: ${summarizeSkippedTables(
+            preservedCriticalState.skippedTables
+          )}`
+        );
+      }
+    } else if (preservedCriticalState.captureError) {
+      console.warn(
+        `[DB] Could not preserve critical DB state before recreation: ${preservedCriticalState.captureError}`
+      );
+    }
+  }
+
+  // Track whether the DB file is brand new (fresh DATA_DIR / Docker volume).
+  // This is needed so the migration runner skips the mass-migration safety abort
+  // that would otherwise trigger because heuristic seeding marks some migrations
+  // as applied, making the fresh DB look like a wiped existing DB (#1328).
+  const isNewDb = !fs.existsSync(sqliteFile);
 
   // Detect and handle old schema format — preserve data when possible (#146)
   // Uses a single probe connection that becomes the real connection when possible.
   if (fs.existsSync(sqliteFile)) {
     try {
-      const probe = new Database(sqliteFile, { readonly: true });
+      const probe = openSqliteDatabase(sqliteFile, { readonly: true });
       const hasOldSchema = probe
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'")
         .get();
@@ -459,7 +1234,7 @@ export function getDbInstance(): SqliteDatabase {
           console.log(
             `[DB] Old schema_migrations table found but data exists — preserving data (#146)`
           );
-          const fixDb = new Database(sqliteFile);
+          const fixDb = openSqliteDatabase(sqliteFile);
           try {
             fixDb.exec("DROP TABLE IF EXISTS schema_migrations");
             fixDb.pragma("wal_checkpoint(TRUNCATE)");
@@ -488,16 +1263,44 @@ export function getDbInstance(): SqliteDatabase {
       }
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
-      console.warn("[DB] Could not probe existing DB, will create fresh:", message);
+      console.warn("[DB] Could not probe existing DB:", message);
+
+      // If the error is a Node module/ABI failure, throw it immediately to avoid renaming the database
+      if (isNativeSqliteLoadError(e) || message.includes("could not be found")) {
+        throw e;
+      }
+
+      // SAFETY: Never delete the database — rename to backup so data can be recovered.
+      // The old code would silently destroy all user data on any probe failure.
+      const failedPath = sqliteFile + `.probe-failed-${Date.now()}`;
       try {
-        fs.unlinkSync(sqliteFile);
+        fs.renameSync(sqliteFile, failedPath);
+        console.warn(`[DB] Renamed corrupt DB to ${path.basename(failedPath)}`);
+        failedProbePath = failedPath;
+        failedProbeMessage = message;
       } catch {
         /* ok */
       }
     }
   }
 
-  const db = new Database(sqliteFile);
+  if (failedProbePath) {
+    const hasUnsafeSkippedTables = preservedCriticalState.skippedTables.length > 0;
+    const missingSnapshot = !preservedCriticalState.captureSucceeded;
+    if (hasUnsafeSkippedTables || missingSnapshot) {
+      const details = missingSnapshot
+        ? `snapshot_failed=${preservedCriticalState.captureError || "unknown"}`
+        : `skipped_tables=${summarizeSkippedTables(preservedCriticalState.skippedTables)}`;
+      throw new Error(
+        `[DB] Manual recovery required after probe failure. ` +
+          `Preserved database: ${failedProbePath}. ` +
+          `Automatic recovery was aborted because ${details}. ` +
+          `Original probe error: ${failedProbeMessage || "unknown"}.`
+      );
+    }
+  }
+
+  const db = openSqliteDatabase(sqliteFile);
   db.pragma("journal_mode = WAL");
   db.pragma("busy_timeout = 5000");
   db.pragma("synchronous = NORMAL");
@@ -518,17 +1321,38 @@ export function getDbInstance(): SqliteDatabase {
     INSERT OR IGNORE INTO _omniroute_migrations (version, name)
     VALUES ('001', 'initial_schema');
   `);
-  if (hasColumn(db, "combos", "sort_order")) {
-    db.prepare("INSERT OR IGNORE INTO _omniroute_migrations (version, name) VALUES (?, ?)").run(
-      "020",
-      "combo_sort_order"
-    );
-  }
-  runMigrations(db);
+
+  runMigrations(db, { isNewDb });
+
+  offloadLegacyCallLogDetails(db);
 
   // Auto-migrate from db.json if exists
   if (jsonDbFile && fs.existsSync(jsonDbFile)) {
     migrateFromJson(db, jsonDbFile);
+  }
+
+  if (failedProbePath && preservedCriticalState.preservedTables.length > 0) {
+    try {
+      const restoredTables = restoreCriticalDbState(db, preservedCriticalState);
+      console.log(
+        `[DB] Restored preserved critical DB state after probe failure: ${summarizePreservedTables(
+          restoredTables
+        )}`
+      );
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      try {
+        if (db.open) db.close();
+      } catch {
+        /* ignore */
+      }
+      cleanupRecreatedSqliteFiles(sqliteFile);
+      throw new Error(
+        `[DB] Automatic recovery aborted after probe failure. ` +
+          `Preserved database: ${failedProbePath}. ` +
+          `Restore failure: ${message}.`
+      );
+    }
   }
 
   // Store schema version
@@ -536,13 +1360,31 @@ export function getDbInstance(): SqliteDatabase {
     "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '1')"
   );
   versionStmt.run();
+  if (shouldRunStartupDbHealthCheck()) {
+    runDbHealthCheck(db, {
+      autoRepair: true,
+      expectedSchemaVersion: "1",
+      createBackupBeforeRepair: () => createHealthCheckBackup(db),
+    });
+  }
 
   setDb(db);
+
+  // Re-encrypt any tokens using the legacy dynamic salt to canonical static salt
+  try {
+    autoMigrateLegacyEncryptedConnections(db);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[DB] Legacy encryption migration failed: ${message}`);
+  }
+
+  startDbHealthCheckScheduler(db);
   console.log(`[DB] SQLite database ready: ${sqliteFile}`);
   return db;
 }
 
 export function closeDbInstance(options?: { checkpointMode?: CheckpointMode | null }): boolean {
+  clearDbHealthCheckScheduler();
   const db = getDb();
   if (!db) return false;
 
@@ -575,6 +1417,54 @@ export function closeDbInstance(options?: { checkpointMode?: CheckpointMode | nu
  */
 export function resetDbInstance() {
   closeDbInstance();
+}
+
+// ──────────────── Runtime Driver Info ────────────────
+
+type DbDriverInfo = { source: string; kind: string };
+let driverInfoCached: DbDriverInfo | null = null;
+
+function setDriverInfo(info: DbDriverInfo) {
+  driverInfoCached = info;
+}
+
+/** Returns how better-sqlite3 was resolved (bundled / runtime / etc.). Null if not yet init. */
+export function getDriverInfo(): DbDriverInfo | null {
+  return driverInfoCached;
+}
+
+/**
+ * Async initializer that pre-resolves the SQLite runtime before first DB access.
+ *
+ * Call this at process startup (before any call to getDbInstance()) so that
+ * if the bundled better-sqlite3 binary is unavailable, the runtime installer
+ * can place it in ~/.omniroute/runtime/ without blocking a synchronous caller.
+ *
+ * Idempotent — safe to call multiple times.
+ */
+export async function ensureDbInitialized(): Promise<void> {
+  if (getDb()) return;
+
+  // Cloud/build: getDbInstance() cria in-memory, sem necessidade de pré-init
+  if (isCloud || isBuildPhase || !SQLITE_FILE) {
+    getDbInstance();
+    return;
+  }
+
+  // Tenta drivers síncronos primeiro
+  const sync = tryOpenSync(SQLITE_FILE);
+  if (sync) {
+    // Drivers síncronos disponíveis — fechar o probe, getDbInstance() vai abrir com setup completo
+    sync.close();
+    getDbInstance();
+    return;
+  }
+
+  // Nenhum driver síncrono — pré-inicializar sql.js (WASM, async)
+  console.warn("[DB] Pré-inicializando sql.js WASM (drivers síncronos indisponíveis)...");
+  await preInitSqlJs(SQLITE_FILE);
+  // Agora getSqlJsAdapter() retornará o adapter, e getDbInstance() vai usá-lo
+  getDbInstance();
 }
 
 // ──────────────── JSON → SQLite Migration ────────────────
@@ -768,4 +1658,98 @@ function migrateFromJson(db: SqliteDatabase, jsonPath: string) {
   } catch (err) {
     console.error("[DB] Migration from db.json failed:", err.message);
   }
+}
+
+// ──────────────── Auto-Vacuum Management ────────────────
+
+export function setAutoVacuum(mode: "NONE" | "FULL" | "INCREMENTAL"): void {
+  const db = getDbInstance();
+
+  const currentMode = db.pragma("auto_vacuum", { simple: true }) as number;
+  const modeMap: Record<string, number> = {
+    NONE: 0,
+    FULL: 1,
+    INCREMENTAL: 2,
+  };
+
+  const targetMode = modeMap[mode];
+
+  if (currentMode === targetMode) {
+    console.log(`[DB] auto_vacuum already set to ${mode}`);
+    return;
+  }
+
+  console.log(`[DB] Changing auto_vacuum from ${currentMode} to ${mode} (${targetMode})`);
+
+  db.pragma(`auto_vacuum = ${targetMode}`);
+
+  db.exec("VACUUM");
+
+  const newMode = db.pragma("auto_vacuum", { simple: true }) as number;
+  console.log(`[DB] auto_vacuum changed to ${newMode}`);
+}
+
+export function getAutoVacuumMode(): "NONE" | "FULL" | "INCREMENTAL" {
+  const db = getDbInstance();
+  const mode = db.pragma("auto_vacuum", { simple: true }) as number;
+
+  const modeMap: Record<number, "NONE" | "FULL" | "INCREMENTAL"> = {
+    0: "NONE",
+    1: "FULL",
+    2: "INCREMENTAL",
+  };
+
+  return modeMap[mode] || "NONE";
+}
+
+export function runManualVacuum(): { success: boolean; duration: number; error?: string } {
+  const db = getDbInstance();
+  const startTime = Date.now();
+
+  try {
+    console.log("[DB] Starting manual VACUUM...");
+    db.exec("VACUUM");
+    const duration = Date.now() - startTime;
+    console.log(`[DB] Manual VACUUM completed in ${duration}ms`);
+    return { success: true, duration };
+  } catch (err: unknown) {
+    const duration = Date.now() - startTime;
+    console.error("[DB] Manual VACUUM failed:", err);
+    const message = err instanceof Error ? err.message : String(err);
+    return { success: false, duration, error: message };
+  }
+}
+
+export function setPageSize(pageSize: number): void {
+  const db = getDbInstance();
+  const currentPageSize = db.pragma("page_size", { simple: true }) as number;
+
+  if (currentPageSize === pageSize) {
+    console.log(`[DB] page_size already set to ${pageSize}`);
+    return;
+  }
+
+  console.log(`[DB] Changing page_size from ${currentPageSize} to ${pageSize}`);
+  db.pragma(`page_size = ${pageSize}`);
+  db.exec("VACUUM");
+
+  const newPageSize = db.pragma("page_size", { simple: true }) as number;
+  console.log(`[DB] page_size changed to ${newPageSize}`);
+}
+
+export function setCacheSize(cacheSizeKb: number): void {
+  const db = getDbInstance();
+  const currentCacheSize = db.pragma("cache_size", { simple: true }) as number;
+  const targetCacheSize = -cacheSizeKb;
+
+  if (currentCacheSize === targetCacheSize) {
+    console.log(`[DB] cache_size already set to ${cacheSizeKb}KB`);
+    return;
+  }
+
+  console.log(`[DB] Changing cache_size from ${Math.abs(currentCacheSize)}KB to ${cacheSizeKb}KB`);
+  db.pragma(`cache_size = ${targetCacheSize}`);
+
+  const newCacheSize = db.pragma("cache_size", { simple: true }) as number;
+  console.log(`[DB] cache_size changed to ${Math.abs(newCacheSize)}KB`);
 }

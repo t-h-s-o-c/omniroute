@@ -1,11 +1,264 @@
 import crypto, { randomUUID } from "crypto";
-import { BaseExecutor, mergeUpstreamExtraHeaders } from "./base.ts";
+import {
+  BaseExecutor,
+  mergeUpstreamExtraHeaders,
+  type ExecuteInput,
+  type ExecutorLog,
+  type ProviderCredentials,
+} from "./base.ts";
+import { applyFingerprint, isCliCompatEnabled } from "../config/cliFingerprints.ts";
 import { PROVIDERS, OAUTH_ENDPOINTS, HTTP_STATUS } from "../config/constants.ts";
+import { scrubProxyAndFingerprintHeaders } from "../services/antigravityHeaderScrub.ts";
+import {
+  antigravityNativeOAuthUserAgent,
+  antigravityUserAgent,
+} from "../services/antigravityHeaders.ts";
+import { classify429, decide429, type Decision } from "../services/antigravity429Engine.ts";
+import {
+  injectCreditsField,
+  shouldRetryWithCredits,
+  shouldUseCreditsFirst,
+  getCreditsMode,
+  handleCreditsFailure,
+} from "../services/antigravityCredits.ts";
+import { persistCreditBalance, getAllPersistedCreditBalances } from "@/lib/db/creditBalance";
+import { obfuscateSensitiveWords } from "../services/antigravityObfuscation.ts";
+import { resolveAntigravityVersion } from "../services/antigravityVersion.ts";
+import { resolveAntigravityModelId } from "../config/antigravityModelAliases.ts";
+import { cloakAntigravityToolPayload } from "../config/toolCloaking.ts";
+import {
+  shouldStripCloudCodeThinking,
+  stripCloudCodeThinkingConfig,
+} from "../services/cloudCodeThinking.ts";
+import { buildGeminiTools } from "../translator/helpers/geminiToolsSanitizer.ts";
+import {
+  applyAntigravityClientProfileHeaders,
+  removeHeaderCaseInsensitive,
+} from "../services/antigravityClientProfile.ts";
+import {
+  generateAntigravityRequestId,
+  getAntigravityEnvelopeUserAgent,
+  getAntigravitySessionId,
+} from "../services/antigravityIdentity.ts";
 
 const MAX_RETRY_AFTER_MS = 60_000;
 const LONG_RETRY_THRESHOLD_MS = 60_000;
+const CREDITS_EXHAUSTED_TTL_MS = 5 * 60 * 60 * 1000; // 5 hours
 
 const BARE_PRO_IDS = new Set(["gemini-3.1-pro"]);
+
+interface AntigravityContent {
+  role: string;
+  parts: unknown[];
+  [key: string]: unknown;
+}
+
+type AntigravityCredentials = ProviderCredentials & {
+  projectId?: string | null;
+  expiresIn?: number;
+};
+
+type AntigravityChunkContent = Record<string, unknown> & {
+  role?: string;
+  parts?: Array<
+    Record<string, unknown> & {
+      text?: unknown;
+      functionCall?: Record<string, unknown>;
+      functionResponse?: unknown;
+      thought?: unknown;
+      thoughtSignature?: unknown;
+    }
+  >;
+};
+
+type AntigravityCreditEntry = {
+  creditType?: string;
+  creditAmount?: string;
+};
+
+function getChunkedOrFixedBody(bodyStr: string, stream: boolean): BodyInit {
+  if (stream) {
+    return new ReadableStream({
+      async start(controller) {
+        controller.enqueue(new TextEncoder().encode(bodyStr));
+        controller.close();
+      },
+    });
+  }
+  return bodyStr;
+}
+
+function cloneAntigravityRequestBody(body: unknown): unknown {
+  if (!body || typeof body !== "object") {
+    return body;
+  }
+
+  try {
+    return structuredClone(body);
+  } catch {
+    return JSON.parse(JSON.stringify(body));
+  }
+}
+
+function serializeAntigravityRequest(
+  provider: string,
+  headers: Record<string, string>,
+  body: unknown
+): { headers: Record<string, string>; bodyString: string } {
+  const serializedBody = cloneAntigravityRequestBody(body);
+
+  if (!isCliCompatEnabled(provider)) {
+    return { headers, bodyString: JSON.stringify(serializedBody) };
+  }
+  return applyFingerprint(provider, { ...headers }, serializedBody);
+}
+
+type AntigravityCollectedStream = {
+  textContent: string;
+  finishReason: string;
+  usage: Record<string, unknown> | null;
+  remainingCredits: Array<{ creditType: string; creditAmount: string }> | null;
+};
+
+type AntigravityRequestEnvelope = Record<string, unknown> & {
+  project: string;
+  model: string;
+  userAgent: "antigravity" | "jetski";
+  requestType: "agent" | "image_gen";
+  requestId: string;
+  request: Record<string, unknown>;
+  enabledCreditTypes?: string[];
+};
+
+/**
+ * Per-account GOOGLE_ONE_AI credits-exhausted tracker.
+ * Key: accountId (OAuth subject / email). Value: expiry timestamp.
+ * When credits hit 0 we skip the credit retry for CREDITS_EXHAUSTED_TTL_MS.
+ */
+const creditsExhaustedUntil = new Map<string, number>();
+
+/**
+ * Per-account GOOGLE_ONE_AI remaining credit balance cache.
+ * Populated from the final SSE chunk's `remainingCredits` field after every
+ * successful credit-injected request. Keyed by accountId.
+ * On first access, hydrated from the DB-persisted balances so values survive restarts.
+ */
+const creditBalanceCache = new Map<string, number>();
+let creditCacheHydrated = false;
+
+function hydrateCreditCacheFromDb(): void {
+  if (creditCacheHydrated) return;
+  creditCacheHydrated = true;
+  try {
+    const persisted = getAllPersistedCreditBalances();
+    for (const [accountId, balance] of persisted) {
+      // Only fill in accounts not already populated by a live SSE response
+      if (!creditBalanceCache.has(accountId)) {
+        creditBalanceCache.set(accountId, balance);
+      }
+    }
+  } catch {
+    // DB not ready yet (build phase, etc.) — ignore silently
+  }
+}
+
+/** Read the last-known GOOGLE_ONE_AI credit balance for a given account. */
+export function getAntigravityRemainingCredits(accountId: string): number | null {
+  hydrateCreditCacheFromDb();
+  const balance = creditBalanceCache.get(accountId);
+  return balance !== undefined ? balance : null;
+}
+
+/** Update the balance cache — called when we parse `remainingCredits` from an SSE stream. */
+export function updateAntigravityRemainingCredits(accountId: string, balance: number): void {
+  creditBalanceCache.set(accountId, balance);
+  // Persist to DB so the value survives server restarts
+  try {
+    persistCreditBalance(accountId, balance);
+  } catch {
+    // Non-critical — in-memory cache is the primary source
+  }
+}
+
+function isCreditsExhausted(accountId: string): boolean {
+  const until = creditsExhaustedUntil.get(accountId);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    creditsExhaustedUntil.delete(accountId);
+    return false;
+  }
+  return true;
+}
+
+function markCreditsExhausted(accountId: string): void {
+  creditsExhaustedUntil.set(accountId, Date.now() + CREDITS_EXHAUSTED_TTL_MS);
+}
+
+function processAntigravitySSEPayload(
+  payload: string,
+  collected: AntigravityCollectedStream,
+  log?: { debug?: (scope: string, message: string) => void }
+) {
+  if (!payload || payload === "[DONE]") return;
+  try {
+    const parsed = JSON.parse(payload);
+    const candidate = parsed?.response?.candidates?.[0];
+    if (candidate?.content?.parts) {
+      for (const part of candidate.content.parts) {
+        if (typeof part.text === "string" && !part.thought && !part.thoughtSignature) {
+          collected.textContent += part.text;
+        }
+      }
+    }
+    if (candidate?.finishReason) {
+      collected.finishReason =
+        candidate.finishReason.toLowerCase() === "stop"
+          ? "stop"
+          : candidate.finishReason.toLowerCase();
+    }
+    if (parsed?.response?.usageMetadata) {
+      const um = parsed.response.usageMetadata;
+      collected.usage = {
+        prompt_tokens: um.promptTokenCount || 0,
+        completion_tokens: um.candidatesTokenCount || 0,
+        total_tokens: um.totalTokenCount || 0,
+      };
+    }
+    if (Array.isArray(parsed?.remainingCredits)) {
+      collected.remainingCredits = parsed.remainingCredits;
+    }
+  } catch {
+    log?.debug?.("SSE_PARSE", `Skipping malformed SSE line: ${payload.slice(0, 80)}`);
+  }
+}
+
+function processAntigravitySSEText(
+  text: string,
+  partialLine: { value: string },
+  collected: AntigravityCollectedStream,
+  log?: { debug?: (scope: string, message: string) => void }
+) {
+  partialLine.value += text;
+  const lines = partialLine.value.split("\n");
+  partialLine.value = lines.pop() || "";
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    processAntigravitySSEPayload(trimmed.slice(5).trim(), collected, log);
+  }
+}
+
+function flushAntigravitySSEText(
+  partialLine: { value: string },
+  collected: AntigravityCollectedStream,
+  log?: { debug?: (scope: string, message: string) => void }
+) {
+  const trimmed = partialLine.value.trim();
+  partialLine.value = "";
+  if (!trimmed.startsWith("data:")) return;
+  processAntigravitySSEPayload(trimmed.slice(5).trim(), collected, log);
+}
 
 /**
  * Strip provider prefixes (e.g. "antigravity/model" → "model").
@@ -14,6 +267,7 @@ const BARE_PRO_IDS = new Set(["gemini-3.1-pro"]);
 function cleanModelName(model: string): string {
   if (!model) return model;
   let clean = model.includes("/") ? model.split("/").pop()! : model;
+  clean = resolveAntigravityModelId(clean);
   // Normalize bare Pro IDs to the Low tier (matching OpenClaw convention).
   // The upstream API requires an explicit tier suffix; bare IDs cause errors.
   if (BARE_PRO_IDS.has(clean)) {
@@ -22,12 +276,101 @@ function cleanModelName(model: string): string {
   return clean;
 }
 
+function attachToolNameMap<T>(payload: T, toolNameMap: Map<string, string> | null): T {
+  if (!toolNameMap?.size || !payload || typeof payload !== "object") {
+    return payload;
+  }
+
+  const copy = Array.isArray(payload) ? ([...payload] as T) : ({ ...(payload as object) } as T);
+  Object.defineProperty(copy, "_toolNameMap", {
+    value: toolNameMap,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+  return copy;
+}
+
+function getRequestTargetModel(body: Record<string, unknown>): string {
+  const target = body.model;
+  return typeof target === "string" && target.length > 0 ? target : "unknown";
+}
+
+function applyAntigravityGenerationDefaults(request: Record<string, unknown>): void {
+  const generationConfig =
+    request.generationConfig && typeof request.generationConfig === "object"
+      ? (request.generationConfig as Record<string, unknown>)
+      : {};
+
+  if (generationConfig.topK === undefined) {
+    generationConfig.topK = 40;
+  }
+  if (generationConfig.topP === undefined) {
+    generationConfig.topP = 1.0;
+  }
+
+  const thinkingConfig =
+    generationConfig.thinkingConfig && typeof generationConfig.thinkingConfig === "object"
+      ? (generationConfig.thinkingConfig as Record<string, unknown>)
+      : null;
+  const thinkingBudget = Number(thinkingConfig?.thinkingBudget);
+  const maxOutputTokens = Number(generationConfig.maxOutputTokens);
+  if (
+    Number.isFinite(thinkingBudget) &&
+    thinkingBudget > 0 &&
+    (!Number.isFinite(maxOutputTokens) || maxOutputTokens <= thinkingBudget)
+  ) {
+    generationConfig.maxOutputTokens = Math.floor(thinkingBudget) + 1;
+  }
+
+  request.generationConfig = generationConfig;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function sanitizeAntigravityGeminiRequest(
+  request: Record<string, unknown>
+): Record<string, unknown> {
+  const clean: Record<string, unknown> = {};
+
+  if (Array.isArray(request.contents)) {
+    clean.contents = request.contents;
+  }
+
+  if (asRecord(request.systemInstruction)) {
+    clean.systemInstruction = request.systemInstruction;
+  }
+
+  clean.generationConfig = asRecord(request.generationConfig)
+    ? { ...(request.generationConfig as Record<string, unknown>) }
+    : {};
+
+  const geminiTools = buildGeminiTools(request.tools);
+  if (geminiTools) {
+    clean.tools = geminiTools;
+    clean.toolConfig = { functionCallingConfig: { mode: "VALIDATED" } };
+  } else if (asRecord(request.toolConfig)) {
+    clean.toolConfig = request.toolConfig;
+  }
+
+  if (typeof request.sessionId === "string") {
+    clean.sessionId = request.sessionId;
+  }
+
+  return clean;
+}
+
 export class AntigravityExecutor extends BaseExecutor {
   constructor() {
     super("antigravity", PROVIDERS.antigravity);
   }
 
-  buildUrl(model, stream, urlIndex = 0) {
+  buildUrl(model: string, _stream: boolean, urlIndex = 0): string {
+    void model;
     const baseUrls = this.getBaseUrls();
     const baseUrl = baseUrls[urlIndex] || baseUrls[0];
     // Always use streaming endpoint — the non-streaming `generateContent` causes
@@ -38,22 +381,38 @@ export class AntigravityExecutor extends BaseExecutor {
     return `${baseUrl}/v1internal:streamGenerateContent?alt=sse`;
   }
 
-  buildHeaders(credentials, stream = true) {
-    return {
+  buildHeaders(credentials: AntigravityCredentials, _stream = true): Record<string, string> {
+    const raw = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${credentials.accessToken}`,
-      "User-Agent": this.config.headers?.["User-Agent"] || "antigravity/1.104.0 darwin/arm64",
-      "X-OmniRoute-Source": "omniroute",
+      "User-Agent": antigravityUserAgent(),
       Accept: "text/event-stream",
+      "X-OmniRoute-Source": "omniroute",
     };
+    // Scrub proxy/fingerprint headers that reveal non-native traffic
+    return scrubProxyAndFingerprintHeaders(raw);
   }
 
-  transformRequest(model, body, stream, credentials) {
+  transformRequest(
+    model: string,
+    body: unknown,
+    _stream: boolean,
+    credentials: AntigravityCredentials
+  ): AntigravityRequestEnvelope | Response {
     // TODO: Consider removing project override like gemini-cli.ts — stored projectId
     // can become stale for Cloud Code accounts, causing 403 "has not been used in project X".
     // Antigravity accounts may have more stable project IDs, but the risk exists.
-    const bodyProjectId = body?.project;
-    const credentialsProjectId = credentials?.projectId;
+    const normalizeProjectId = (value: unknown): string | null => {
+      if (typeof value !== "string") return null;
+      const trimmedValue = value.trim();
+      return trimmedValue ? trimmedValue : null;
+    };
+    const bodyRecord = asRecord(body) ?? {};
+    const bodyProjectId = normalizeProjectId(bodyRecord.project);
+    const credentialsProjectId = normalizeProjectId(credentials?.projectId);
+    const providerSpecificProjectId = normalizeProjectId(
+      (credentials?.providerSpecificData as Record<string, unknown> | undefined)?.projectId
+    );
     const allowBodyProjectOverride = process.env.OMNIROUTE_ALLOW_BODY_PROJECT_OVERRIDE === "1";
 
     // Default: prefer OAuth-stored projectId over incoming body.project to avoid
@@ -62,7 +421,7 @@ export class AntigravityExecutor extends BaseExecutor {
     const projectId =
       allowBodyProjectOverride && bodyProjectId
         ? bodyProjectId
-        : credentialsProjectId || bodyProjectId;
+        : credentialsProjectId || providerSpecificProjectId || bodyProjectId;
 
     if (!projectId) {
       // (#489) Return a structured error instead of throwing — gives the client a clear signal
@@ -84,53 +443,115 @@ export class AntigravityExecutor extends BaseExecutor {
       return resp as unknown as never;
     }
 
-    // Fix contents for Claude models via Antigravity
-    const normalizedContents =
-      body.request?.contents?.map((c) => {
-        let role = c.role;
-        // functionResponse must be role "user" for Claude models
+    const upstreamModel = cleanModelName(model);
+    const isClaude = upstreamModel.toLowerCase().includes("claude");
+    const baseBody = bodyRecord;
+    const normalizedBody = shouldStripCloudCodeThinking(this.provider, upstreamModel)
+      ? stripCloudCodeThinkingConfig(baseBody)
+      : baseBody;
+    const normalizedRequest = asRecord(normalizedBody.request);
+    const rawContents = Array.isArray(normalizedRequest?.contents)
+      ? normalizedRequest.contents
+      : [];
+
+    // Fix contents for Gemini-compatible Cloud Code requests via Antigravity.
+    // Claude-branded Antigravity models use the same streamGenerateContent schema.
+    const normalizedContents: AntigravityContent[] =
+      rawContents.map((content): AntigravityContent => {
+        const c = content as AntigravityChunkContent;
+        let role = typeof c.role === "string" ? c.role : "user";
         if (c.parts?.some((p) => p.functionResponse)) {
           role = "user";
         }
 
         const hasFunctionCall = c.parts?.some((p) => p.functionCall) || false;
 
-        // Antigravity rejects synthetic thought text, but Gemini 3+ requires any
-        // returned thoughtSignature metadata to survive model tool-call turns.
         const parts =
-          c.parts?.filter((p) => !p.thought && (hasFunctionCall || !p.thoughtSignature)) || [];
+          c.parts?.filter((p) => {
+            if (typeof p.text === "string" && p.text === "") return false;
+            if (p.functionCall && !p.functionCall.name) return false;
+
+            return !p.thought && (hasFunctionCall || !p.thoughtSignature);
+          }) || [];
         return { ...c, role, parts };
       }) || [];
 
-    const contents = normalizedContents.filter((c) =>
-      Array.isArray(c.parts) ? c.parts.length > 0 : true
-    );
+    const contents: AntigravityContent[] = [];
+    for (const c of normalizedContents) {
+      if (!Array.isArray(c.parts) || c.parts.length === 0) continue;
+      if (contents.length > 0 && contents[contents.length - 1].role === c.role) {
+        contents[contents.length - 1].parts.push(...c.parts);
+      } else {
+        contents.push(c);
+      }
+    }
 
-    const transformedRequest = {
-      ...body.request,
+    const rawTransformedRequest = {
+      ...normalizedRequest,
       ...(contents.length > 0 && { contents }),
-      sessionId: body.request?.sessionId || this.generateSessionId(),
+      sessionId: getAntigravitySessionId(
+        credentials,
+        typeof normalizedRequest?.sessionId === "string" ? normalizedRequest.sessionId : undefined
+      ),
       safetySettings: undefined,
       toolConfig:
-        body.request?.tools?.length > 0
+        Array.isArray(normalizedRequest?.tools) && normalizedRequest.tools.length > 0
           ? { functionCallingConfig: { mode: "VALIDATED" } }
-          : body.request?.toolConfig,
+          : normalizedRequest?.toolConfig,
     };
 
-    const upstreamModel = cleanModelName(model);
+    const transformedRequest = isClaude
+      ? sanitizeAntigravityGeminiRequest(rawTransformedRequest)
+      : rawTransformedRequest;
 
-    return {
-      ...body,
+    // Obfuscate sensitive client names in user content (e.g. "OpenCode", "Cursor")
+    const requestContents = transformedRequest.contents;
+    if (Array.isArray(requestContents)) {
+      for (const msg of requestContents) {
+        if (Array.isArray(msg.parts)) {
+          for (const part of msg.parts) {
+            if (typeof part.text === "string") {
+              part.text = obfuscateSensitiveWords(part.text);
+            }
+          }
+        }
+      }
+    }
+
+    applyAntigravityGenerationDefaults(transformedRequest);
+
+    const {
+      project: _project,
+      model: _model,
+      userAgent: _userAgent,
+      requestType: _requestType,
+      requestId: _requestId,
+      request: _request,
+      ...passthroughFields
+    } = normalizedBody;
+
+    const requestType = _requestType === "image_gen" ? "image_gen" : "agent";
+    const envelope: AntigravityRequestEnvelope = {
       project: projectId,
-      model: upstreamModel,
-      userAgent: "antigravity",
-      requestType: "agent",
-      requestId: `agent-${crypto.randomUUID()}`,
+      requestId: generateAntigravityRequestId(),
       request: transformedRequest,
+      model: upstreamModel,
+      userAgent: getAntigravityEnvelopeUserAgent(credentials),
+      requestType,
+      ...passthroughFields,
     };
+
+    if (requestType === "agent" && envelope.enabledCreditTypes === undefined) {
+      envelope.enabledCreditTypes = ["GOOGLE_ONE_AI"];
+    }
+
+    return envelope;
   }
 
-  async refreshCredentials(credentials, log) {
+  async refreshCredentials(
+    credentials: AntigravityCredentials,
+    log?: ExecutorLog | null
+  ): Promise<AntigravityCredentials | null> {
     if (!credentials.refreshToken) return null;
 
     try {
@@ -139,37 +560,42 @@ export class AntigravityExecutor extends BaseExecutor {
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
           Accept: "application/json",
+          "User-Agent": antigravityNativeOAuthUserAgent(),
         },
         body: new URLSearchParams({
           grant_type: "refresh_token",
-          refresh_token: credentials.refreshToken,
-          client_id: this.config.clientId,
-          client_secret: this.config.clientSecret,
+          refresh_token: credentials.refreshToken || "",
+          client_id: this.config.clientId || "",
+          client_secret: this.config.clientSecret || "",
         }),
       });
 
       if (!response.ok) return null;
 
-      const tokens = await response.json();
+      const tokens = (await response.json()) as Record<string, unknown>;
       log?.info?.("TOKEN", "Antigravity refreshed");
 
       return {
-        accessToken: tokens.access_token,
-        refreshToken: tokens.refresh_token || credentials.refreshToken,
-        expiresIn: tokens.expires_in,
+        accessToken: typeof tokens.access_token === "string" ? tokens.access_token : undefined,
+        refreshToken:
+          typeof tokens.refresh_token === "string"
+            ? tokens.refresh_token
+            : credentials.refreshToken,
+        expiresIn: typeof tokens.expires_in === "number" ? tokens.expires_in : undefined,
         projectId: credentials.projectId,
       };
     } catch (error) {
-      log?.error?.("TOKEN", `Antigravity refresh error: ${error.message}`);
+      const message = error instanceof Error ? error.message : String(error);
+      log?.error?.("TOKEN", `Antigravity refresh error: ${message}`);
       return null;
     }
   }
 
-  generateSessionId() {
+  generateSessionId(): string {
     return `-${parseInt(randomUUID().replace(/-/g, "").substring(0, 8), 16) % 9_000_000_000_000_000_000}`;
   }
 
-  parseRetryHeaders(headers) {
+  parseRetryHeaders(headers: Headers | null | undefined): number | null {
     if (!headers?.get) return null;
 
     const retryAfter = headers.get("retry-after");
@@ -202,7 +628,7 @@ export class AntigravityExecutor extends BaseExecutor {
 
   // Parse retry time from Antigravity error message body
   // Format: "Your quota will reset after 2h7m23s" or "1h30m" or "45m" or "30s"
-  parseRetryFromErrorMessage(errorMessage) {
+  parseRetryFromErrorMessage(errorMessage: unknown): number | null {
     if (!errorMessage || typeof errorMessage !== "string") return null;
 
     const match = errorMessage.match(/reset (?:after|in) (\d+h)?(\d+m)?(\d+s)?/i);
@@ -213,7 +639,12 @@ export class AntigravityExecutor extends BaseExecutor {
     if (match[2]) totalMs += parseInt(match[2]) * 60 * 1000; // minutes
     if (match[3]) totalMs += parseInt(match[3]) * 1000; // seconds
 
-    return totalMs > 0 ? totalMs : null;
+    // "reset after 0s" = burst/RPM limit, not quota exhaustion.
+    // Return a minimum backoff so the auto-retry loop handles it
+    // instead of falling through to the 24h exhaustion classifier.
+    if (totalMs === 0) return 2_000; // 2s minimum burst-limit backoff
+
+    return totalMs;
   }
 
   /**
@@ -221,14 +652,33 @@ export class AntigravityExecutor extends BaseExecutor {
    * Parses Gemini-format SSE chunks and assembles text content + usage into one
    * OpenAI-format chat.completion payload.
    */
-  collectStreamToResponse(response, model, url, headers, transformedBody, log?, signal?) {
+  collectStreamToResponse(
+    response: Response,
+    model: string,
+    url: string,
+    headers: Record<string, string>,
+    transformedBody: Record<string, unknown>,
+    log?: ExecutorLog | null,
+    signal?: AbortSignal | null
+  ) {
+    if (!response.body) {
+      return Promise.resolve({ response, url, headers, transformedBody });
+    }
+
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
+    const logger = log || undefined;
 
     const SSE_COLLECT_TIMEOUT_MS = 120_000;
 
     const collect = async () => {
-      const chunks: string[] = [];
+      const collected: AntigravityCollectedStream = {
+        textContent: "",
+        finishReason: "stop",
+        usage: null,
+        remainingCredits: null,
+      };
+      const partialLine = { value: "" };
       let timedOut = false;
       const timeout = AbortSignal.timeout(SSE_COLLECT_TIMEOUT_MS);
       try {
@@ -245,7 +695,12 @@ export class AntigravityExecutor extends BaseExecutor {
             ),
           ]);
           if (done) break;
-          chunks.push(decoder.decode(value, { stream: true }));
+          processAntigravitySSEText(
+            decoder.decode(value, { stream: true }),
+            partialLine,
+            collected,
+            logger
+          );
         }
       } catch (err) {
         const msg = err?.message || String(err);
@@ -253,46 +708,8 @@ export class AntigravityExecutor extends BaseExecutor {
         log?.warn?.("SSE_COLLECT", `Error collecting SSE stream: ${msg}`);
         // Fall through — return whatever was collected so far
       }
-      const rawSSE = chunks.join("");
-
-      // Parse Gemini SSE: each line is "data: {json}"
-      let textContent = "";
-      let finishReason = "stop";
-      let usage: Record<string, unknown> | null = null;
-      const lines = rawSSE.split("\n");
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-        const payload = trimmed.slice(5).trim();
-        if (!payload || payload === "[DONE]") continue;
-        try {
-          const parsed = JSON.parse(payload);
-          const candidate = parsed?.response?.candidates?.[0];
-          if (candidate?.content?.parts) {
-            for (const part of candidate.content.parts) {
-              if (typeof part.text === "string" && !part.thought && !part.thoughtSignature) {
-                textContent += part.text;
-              }
-            }
-          }
-          if (candidate?.finishReason) {
-            finishReason =
-              candidate.finishReason.toLowerCase() === "stop"
-                ? "stop"
-                : candidate.finishReason.toLowerCase();
-          }
-          if (parsed?.response?.usageMetadata) {
-            const um = parsed.response.usageMetadata;
-            usage = {
-              prompt_tokens: um.promptTokenCount || 0,
-              completion_tokens: um.candidatesTokenCount || 0,
-              total_tokens: um.totalTokenCount || 0,
-            };
-          }
-        } catch (e) {
-          log?.debug?.("SSE_PARSE", `Skipping malformed SSE line: ${payload.slice(0, 80)}`);
-        }
-      }
+      processAntigravitySSEText(decoder.decode(), partialLine, collected, logger);
+      flushAntigravitySSEText(partialLine, collected, logger);
 
       const result = {
         id: `chatcmpl-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
@@ -302,11 +719,13 @@ export class AntigravityExecutor extends BaseExecutor {
         choices: [
           {
             index: 0,
-            message: { role: "assistant", content: textContent },
-            finish_reason: timedOut ? "length" : finishReason,
+            message: { role: "assistant", content: collected.textContent },
+            finish_reason: timedOut ? "length" : collected.finishReason,
           },
         ],
-        ...(usage && { usage }),
+        ...(collected.usage && { usage: collected.usage }),
+        // Expose credit balance for upstream consumers (usage service, dashboard)
+        ...(collected.remainingCredits && { _remainingCredits: collected.remainingCredits }),
       };
 
       const syntheticStatus = timedOut ? 504 : response.status;
@@ -322,23 +741,65 @@ export class AntigravityExecutor extends BaseExecutor {
     return collect();
   }
 
-  async execute({ model, body, stream, credentials, signal, log, upstreamExtraHeaders }) {
+  async execute({
+    model,
+    body,
+    stream,
+    credentials,
+    signal,
+    log,
+    upstreamExtraHeaders,
+  }: ExecuteInput) {
+    await resolveAntigravityVersion();
     const fallbackCount = this.getFallbackCount();
     let lastError = null;
     let lastStatus = 0;
     const MAX_AUTO_RETRIES = 3;
-    const retryAttemptsByUrl = {}; // Track retry attempts per URL
+    const retryAttemptsByUrl: Record<number, number> = {}; // Track retry attempts per URL
 
     // Always stream upstream — buildUrl always returns the streaming endpoint.
     // For non-streaming clients, we collect the SSE below and return a synthetic
     // non-streaming Response so chatCore's non-streaming path stays unchanged.
     const upstreamStream = true;
 
+    // Account ID for credits tracking.
+    // Use connectionId as the stable cache key — it's available in both the executor
+    // (via credentials.connectionId) and the usage fetcher (via connection.id).
+    // The email-based key was unreliable because email isn't always on the credentials object.
+    const accountId: string = credentials?.connectionId || "unknown";
+
+    // Resolve credits mode once per execute() call. "always" injects
+    // enabledCreditTypes: ["GOOGLE_ONE_AI"] on the first request so the
+    // preflight normal call is skipped entirely.
+    const creditsMode = getCreditsMode();
+    const useCreditsFirst = shouldUseCreditsFirst(credentials?.accessToken || "", creditsMode);
+
     for (let urlIndex = 0; urlIndex < fallbackCount; urlIndex++) {
       const url = this.buildUrl(model, upstreamStream, urlIndex);
       const headers = this.buildHeaders(credentials, upstreamStream);
       mergeUpstreamExtraHeaders(headers, upstreamExtraHeaders);
-      const transformedBody = await this.transformRequest(model, body, upstreamStream, credentials);
+      const transformed = await this.transformRequest(model, body, upstreamStream, credentials);
+      let requestToolNameMap: Map<string, string> | null = null;
+
+      if (transformed instanceof Response) {
+        return { response: transformed, url, headers, transformedBody: body };
+      }
+
+      let transformedBody: Record<string, unknown> = transformed;
+
+      if (transformedBody && typeof transformedBody === "object") {
+        const cloaked = cloakAntigravityToolPayload(transformedBody);
+        transformedBody = cloaked.body;
+        requestToolNameMap = cloaked.toolNameMap;
+      }
+
+      // Credits-first: inject GOOGLE_ONE_AI upfront so we never try the normal
+      // quota path. If credits are exhausted / disabled shouldUseCreditsFirst()
+      // returns false and we fall back to the legacy retry-on-429 flow.
+      if (useCreditsFirst) {
+        transformedBody = injectCreditsField(transformedBody);
+        log?.debug?.("AG_CREDITS", "Credits-first enabled (ANTIGRAVITY_CREDITS=always)");
+      }
 
       // Initialize retry counter for this URL
       if (!retryAttemptsByUrl[urlIndex]) {
@@ -346,15 +807,79 @@ export class AntigravityExecutor extends BaseExecutor {
       }
 
       try {
-        const response = await fetch(url, {
-          method: "POST",
+        const serializedRequest = serializeAntigravityRequest(
+          this.provider,
           headers,
-          body: JSON.stringify(transformedBody),
+          transformedBody
+        );
+        let finalHeaders = serializedRequest.headers;
+        const clientProfile = applyAntigravityClientProfileHeaders(
+          finalHeaders,
+          credentials,
+          transformedBody
+        );
+
+        log?.debug?.(
+          "TELEMETRY",
+          `[Antigravity] Execute - URL: ${url}, Model: ${model}, Target: ${getRequestTargetModel(transformedBody)}, RetryAttempt: ${retryAttemptsByUrl[urlIndex]}`
+        );
+
+        // Dump outgoing headers (mask Authorization) and envelope shape for debugging
+        if (log?.debug) {
+          const safeHeaders = { ...finalHeaders };
+          if (safeHeaders["Authorization"]) safeHeaders["Authorization"] = "Bearer ***";
+          log.debug("AG_REQUEST_HEADERS", JSON.stringify(safeHeaders));
+
+          const envelope = transformedBody as Record<string, unknown>;
+          const requestInner = envelope.request as Record<string, unknown> | undefined;
+          log.debug(
+            "AG_REQUEST_ENVELOPE",
+            JSON.stringify({
+              fieldOrder: Object.keys(envelope),
+              project: envelope.project,
+              requestId: envelope.requestId,
+              model: envelope.model,
+              userAgent: envelope.userAgent,
+              requestType: envelope.requestType,
+              enabledCreditTypes: envelope.enabledCreditTypes,
+              clientProfile,
+              sessionId: requestInner?.sessionId,
+              generationConfig: requestInner?.generationConfig,
+            })
+          );
+        }
+
+        let response = await fetch(url, {
+          method: "POST",
+          headers: finalHeaders,
+          body: getChunkedOrFixedBody(serializedRequest.bodyString, stream),
+          ...(stream ? { duplex: "half" } : {}),
           signal,
         });
 
+        if (response.status === HTTP_STATUS.FORBIDDEN && finalHeaders["x-goog-user-project"]) {
+          const retryHeaders = { ...finalHeaders };
+          removeHeaderCaseInsensitive(retryHeaders, "x-goog-user-project");
+          log?.debug?.("RETRY", "403 with x-goog-user-project, retrying once without it");
+          response = await fetch(url, {
+            method: "POST",
+            headers: retryHeaders,
+            body: getChunkedOrFixedBody(serializedRequest.bodyString, stream),
+            ...(stream ? { duplex: "half" } : {}),
+            signal,
+          });
+          finalHeaders = retryHeaders;
+        }
+
+        if (!response.ok) {
+          log?.warn?.(
+            "TELEMETRY",
+            `[Antigravity] Error Response - URL: ${url}, Status: ${response.status}, Model: ${model}`
+          );
+        }
+
         // Parse retry time for 429/503 responses
-        let retryMs = null;
+        let retryMs: number | null = null;
 
         if (
           response.status === HTTP_STATUS.RATE_LIMITED ||
@@ -369,30 +894,109 @@ export class AntigravityExecutor extends BaseExecutor {
               const errorBody = await response.clone().text();
               const errorJson = JSON.parse(errorBody);
               const errorMessage = errorJson?.error?.message || errorJson?.message || "";
-              retryMs = this.parseRetryFromErrorMessage(errorMessage);
 
-              if (!retryMs) {
-                // Dynamic quota interpretation logic for Free vs Pro accounts
-                const lowerMsg = errorMessage.toLowerCase();
+              // 1. Try to parse explicit retry time from message
+              const parsedRetryMs = this.parseRetryFromErrorMessage(errorMessage);
 
-                if (
-                  lowerMsg.includes("free tier") ||
-                  lowerMsg.includes("exhausted your capacity") ||
-                  lowerMsg.includes("daily limit") ||
-                  lowerMsg.includes("quota exceeded")
-                ) {
-                  // Hard limit hit for Free accounts (or exhausting general capacity), fallback immediately.
-                  // Setting a massive retryMs forces an instant fallback.
-                  retryMs = 24 * 60 * 60 * 1000; // 24 hours
-                } else if (
-                  lowerMsg.includes("pro") ||
-                  lowerMsg.includes("per minute") ||
-                  lowerMsg.includes("rpm")
-                ) {
-                  // RPM limit for Pro counts, backoff up to 1 minute, then fallback
-                  retryMs = 60 * 1000; // 60s
+              // 2. Classify 429 (pass header-parsed retry hint as fallback
+              //    signal — multi-hour Retry-After upgrades rate_limited to
+              //    quota_exhausted so the GOOGLE_ONE_AI credits retry fires).
+              const effectiveRetryHintMs = retryMs ?? parsedRetryMs ?? null;
+              const category = classify429(errorMessage);
+
+              // 3. For quota_exhausted, attempt Google One AI credits retry FIRST!
+              //    Skip if credits were already injected on the first call
+              //    (creditsMode === "always") — no point re-running with the
+              //    same body. Record the failure so the 5h breaker kicks in.
+              const creditsAlreadyInjected =
+                (transformedBody as { enabledCreditTypes?: unknown }).enabledCreditTypes != null;
+
+              if (category === "quota_exhausted" && creditsAlreadyInjected) {
+                handleCreditsFailure(credentials?.accessToken || "");
+                log?.warn?.("AG_CREDITS", "Credits-first request 429'd — credits likely exhausted");
+                markCreditsExhausted(accountId);
+              }
+
+              if (
+                category === "quota_exhausted" &&
+                !creditsAlreadyInjected &&
+                shouldRetryWithCredits(credentials?.accessToken || "", creditsMode !== "off")
+              ) {
+                log?.info?.("AG_CREDITS", "Retrying with Google One AI credits");
+                const creditsBody = injectCreditsField(transformedBody);
+                const serializedCreditsRequest = serializeAntigravityRequest(
+                  this.provider,
+                  headers,
+                  creditsBody
+                );
+                const finalCreditsHeaders = serializedCreditsRequest.headers;
+                try {
+                  const creditsResp = await fetch(url, {
+                    method: "POST",
+                    headers: finalCreditsHeaders,
+                    body: getChunkedOrFixedBody(serializedCreditsRequest.bodyString, stream),
+                    ...(stream ? { duplex: "half" } : {}),
+                    signal,
+                  });
+                  if (creditsResp.ok || creditsResp.status !== HTTP_STATUS.RATE_LIMITED) {
+                    log?.info?.("AG_CREDITS", `Credits retry succeeded: ${creditsResp.status}`);
+                    if (!stream) {
+                      const collected = await this.collectStreamToResponse(
+                        creditsResp,
+                        model,
+                        url,
+                        finalCreditsHeaders,
+                        creditsBody,
+                        log,
+                        signal
+                      );
+                      // Parse _remainingCredits from the synthetic response and cache
+                      try {
+                        const syntheticJson = await collected.response.clone().json();
+                        const rc = syntheticJson?._remainingCredits;
+                        if (Array.isArray(rc)) {
+                          const googleCredit = rc.find((c) => c.creditType === "GOOGLE_ONE_AI");
+                          if (googleCredit) {
+                            const balance = parseInt(googleCredit.creditAmount, 10);
+                            if (!isNaN(balance))
+                              updateAntigravityRemainingCredits(accountId, balance);
+                          }
+                        }
+                      } catch {
+                        /**/
+                      }
+                      return {
+                        ...collected,
+                        transformedBody: attachToolNameMap(creditsBody, requestToolNameMap),
+                      };
+                    }
+                    return {
+                      response: creditsResp,
+                      url,
+                      headers: finalCreditsHeaders,
+                      transformedBody: attachToolNameMap(creditsBody, requestToolNameMap),
+                    };
+                  }
+
+                  // Credit retry also 429'd
+                  handleCreditsFailure(credentials?.accessToken || "");
+                  log?.warn?.("AG_CREDITS", "Credits retry also 429'd");
+
+                  // Also mark in our legacy exhaustion map to avoid retrying other routes
+                  markCreditsExhausted(accountId);
+                } catch (creditsErr) {
+                  handleCreditsFailure(credentials?.accessToken || "");
+                  log?.warn?.("AG_CREDITS", `Credits retry failed: ${creditsErr}`);
                 }
               }
+
+              // 4. Decide final retry time (apply 4-tier engine)
+              const decision: Decision = decide429(category, parsedRetryMs);
+              retryMs = decision.retryAfterMs;
+              log?.debug?.(
+                "AG_429",
+                `Category: ${category}, Decision: ${decision.kind} — ${decision.reason}`
+              );
             } catch (e) {
               // Ignore parse errors, will fall back to exponential backoff
             }
@@ -467,7 +1071,12 @@ export class AntigravityExecutor extends BaseExecutor {
               status: response.status,
               headers: response.headers,
             });
-            return { response: modifiedResponse, url, headers, transformedBody };
+            return {
+              response: modifiedResponse,
+              url,
+              headers: finalHeaders,
+              transformedBody: attachToolNameMap(transformedBody, requestToolNameMap),
+            };
           } catch (err) {
             log?.warn?.("RETRY", `Failed to embed retryAfterMs: ${err}`);
             // Fall back to original response
@@ -477,20 +1086,141 @@ export class AntigravityExecutor extends BaseExecutor {
         // For non-streaming clients, collect the SSE stream and return a synthetic
         // non-streaming Response so chatCore doesn't need to handle SSE conversion.
         if (!stream) {
-          return this.collectStreamToResponse(
+          const collected = await this.collectStreamToResponse(
             response,
             model,
             url,
-            headers,
+            finalHeaders,
             transformedBody,
             log,
             signal
           );
+          // When credits were injected (credits-first or credits-retry), the
+          // synthetic body contains _remainingCredits — mirror it into the
+          // balance cache so the dashboard stays fresh.
+          try {
+            const syntheticJson = await collected.response.clone().json();
+            const rc = syntheticJson?._remainingCredits;
+            if (Array.isArray(rc)) {
+              const googleCredit = rc.find(
+                (c: { creditType?: string }) => c?.creditType === "GOOGLE_ONE_AI"
+              );
+              if (googleCredit) {
+                const balance = parseInt(googleCredit.creditAmount, 10);
+                if (!isNaN(balance)) updateAntigravityRemainingCredits(accountId, balance);
+              }
+            }
+          } catch {
+            /* balance cache is best-effort */
+          }
+          return {
+            ...collected,
+            transformedBody: attachToolNameMap(transformedBody, requestToolNameMap),
+          };
         }
 
-        return { response, url, headers, transformedBody };
+        // Streaming path: wrap the response body in a pass-through TransformStream
+        // that extracts remainingCredits from the final SSE chunk(s) without
+        // consuming the stream. The client receives the unmodified SSE data.
+        if (response.body) {
+          let sseBuffer = "";
+          const decoder = new TextDecoder(); // Singleton for correct streaming decode
+          const MAX_BUFFER_SIZE = 16 * 1024; // Limit to prevent OOM on large streams
+
+          const passThrough = new TransformStream({
+            transform(chunk, controller) {
+              controller.enqueue(chunk);
+              // Accumulate text to scan for remainingCredits
+              try {
+                const text = decoder.decode(chunk, { stream: true });
+                sseBuffer += text;
+                // Limit buffer size to prevent unbounded growth
+                // Truncate only after a complete newline to avoid splitting SSE lines mid-payload
+                if (sseBuffer.length > MAX_BUFFER_SIZE) {
+                  const lastNewline = sseBuffer.lastIndexOf(
+                    "\n",
+                    sseBuffer.length - MAX_BUFFER_SIZE
+                  );
+                  if (lastNewline !== -1) {
+                    sseBuffer = sseBuffer.slice(lastNewline + 1);
+                  } else {
+                    // No newline found in discard region — buffer contains an incomplete SSE line.
+                    // Discard it entirely to avoid returning malformed data; the remainingCredits
+                    // parser won't find valid data in a truncated line anyway.
+                    sseBuffer = "";
+                  }
+                }
+              } catch {
+                /* decoding best-effort */
+              }
+            },
+            flush() {
+              // Final decode for any remaining bytes
+              try {
+                const text = decoder.decode(); // Flush pending bytes
+                sseBuffer += text;
+              } catch {
+                /* decoding best-effort */
+              }
+
+              // Parse the accumulated SSE data for remainingCredits
+              try {
+                const lines = sseBuffer.split("\n");
+                for (const line of lines) {
+                  const trimmed = line.trim();
+                  if (!trimmed.startsWith("data:")) continue;
+                  const payload = trimmed.slice(5).trim();
+                  if (!payload || payload === "[DONE]") continue;
+                  try {
+                    const parsed = JSON.parse(payload);
+                    if (Array.isArray(parsed?.remainingCredits)) {
+                      const googleCredit = parsed.remainingCredits.find((c: unknown) => {
+                        const credit = asRecord(c);
+                        return credit?.creditType === "GOOGLE_ONE_AI";
+                      }) as AntigravityCreditEntry | undefined;
+                      if (googleCredit) {
+                        const balance = parseInt(String(googleCredit.creditAmount ?? ""), 10);
+                        if (!isNaN(balance)) {
+                          updateAntigravityRemainingCredits(accountId, balance);
+                        }
+                      }
+                    }
+                  } catch {
+                    /* skip malformed lines */
+                  }
+                }
+              } catch {
+                /* credits extraction is best-effort */
+              }
+              sseBuffer = "";
+            },
+          });
+          const tappedBody = response.body.pipeThrough(passThrough);
+          const tappedResponse = new Response(tappedBody, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+          });
+          return {
+            response: tappedResponse,
+            url,
+            headers: finalHeaders,
+            transformedBody: attachToolNameMap(transformedBody, requestToolNameMap),
+          };
+        }
+
+        return {
+          response,
+          url,
+          headers: finalHeaders,
+          transformedBody: attachToolNameMap(transformedBody, requestToolNameMap),
+        };
       } catch (error) {
         lastError = error;
+        log?.error?.(
+          "TELEMETRY",
+          `[Antigravity] Network/Fetch Error - URL: ${url}, Model: ${model}, Error: ${error instanceof Error ? error.message : String(error)}`
+        );
         if (urlIndex + 1 < fallbackCount) {
           log?.debug?.("RETRY", `Error on ${url}, trying fallback ${urlIndex + 1}`);
           continue;

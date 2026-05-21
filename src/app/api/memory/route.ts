@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { listMemories, createMemory } from "@/lib/memory/store";
 import { MemoryType } from "@/lib/memory/types";
+import { parsePaginationParams, buildPaginatedResponse } from "@/shared/types/pagination";
 import { z } from "zod";
 import { validateBody, isValidationFailure } from "@/shared/validation/helpers";
 
@@ -15,32 +17,54 @@ const createMemorySchema = z.object({
 });
 
 export async function GET(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   try {
-    const { searchParams } = new URL(request.url);
+    const url = new URL(request.url);
+    const { searchParams } = url;
+
+    const paginationParams = parsePaginationParams(searchParams);
+    const rawOffset = searchParams.get("offset");
+    const offset =
+      typeof rawOffset === "string" && rawOffset.trim().length > 0
+        ? Math.max(0, Number.parseInt(rawOffset, 10) || 0)
+        : undefined;
+    const query = searchParams.get("q") || undefined;
+
     const apiKeyId = searchParams.get("apiKeyId") || undefined;
     const type = (searchParams.get("type") as any) || undefined;
     const sessionId = searchParams.get("sessionId") || undefined;
-    const limitParams = searchParams.get("limit");
-    const offsetParams = searchParams.get("offset");
 
-    const memories = await listMemories({
+    const result = await listMemories({
       apiKeyId,
       type,
       sessionId,
-      limit: limitParams ? parseInt(limitParams, 10) : undefined,
-      offset: offsetParams ? parseInt(offsetParams, 10) : undefined,
+      query,
+      limit: paginationParams.limit,
+      offset,
+      page: offset === undefined ? paginationParams.page : undefined,
     });
+
     const stats = {
-      total: memories.length,
-      byType: memories.reduce(
-        (acc, m) => {
-          acc[m.type] = (acc[m.type] || 0) + 1;
-          return acc;
-        },
-        {} as Record<string, number>
-      ),
+      total: result.total,
+      byType: result.byType ?? {},
     };
-    return NextResponse.json({ memories, stats });
+
+    const responsePagination =
+      offset === undefined
+        ? paginationParams
+        : {
+            ...paginationParams,
+            page: Math.floor(offset / paginationParams.limit) + 1,
+          };
+
+    const paginatedResponse = buildPaginatedResponse(result.data, result.total, responsePagination);
+
+    return NextResponse.json({
+      ...paginatedResponse,
+      stats,
+    });
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error }, { status: 500 });
@@ -48,6 +72,9 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   try {
     const rawBody = await request.json();
     const validation = validateBody(createMemorySchema, rawBody);

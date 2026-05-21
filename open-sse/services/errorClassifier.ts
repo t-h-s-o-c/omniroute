@@ -1,8 +1,10 @@
 import {
   isAccountDeactivated,
   isCreditsExhausted,
+  isDailyQuotaExhausted,
   isOAuthInvalidToken,
 } from "./accountFallback.ts";
+import { getProviderCategory } from "../config/providerRegistry.ts";
 
 export function isEmptyContentResponse(responseBody: unknown): boolean {
   if (!responseBody || typeof responseBody !== "object") return false;
@@ -17,12 +19,16 @@ export function isEmptyContentResponse(responseBody: unknown): boolean {
     const delta = firstChoice.delta as Record<string, unknown> | undefined;
 
     const content = message?.content ?? delta?.content;
+    const reasoningContent = message?.reasoning_content ?? delta?.reasoning_content;
     const hasToolCalls =
       (Array.isArray(message?.tool_calls) && (message.tool_calls as unknown[]).length > 0) ||
       (Array.isArray(delta?.tool_calls) && (delta.tool_calls as unknown[]).length > 0);
 
     const hasContent = content !== null && content !== undefined && content !== "";
-    return !hasContent && !hasToolCalls;
+    const hasReasoning =
+      reasoningContent !== null && reasoningContent !== undefined && reasoningContent !== "";
+
+    return !hasContent && !hasReasoning && !hasToolCalls;
   }
 
   if (Array.isArray(body.content)) {
@@ -86,20 +92,37 @@ function responseBodyToString(responseBody: unknown): string {
   return "";
 }
 
-export function classifyProviderError(statusCode: number, responseBody: unknown): string | null {
+function shouldPreserveQuotaSignalsFor429(provider?: string | null): boolean {
+  if (!provider) return true;
+  return getProviderCategory(provider) === "oauth";
+}
+
+export function classifyProviderError(
+  statusCode: number,
+  responseBody: unknown,
+  provider?: string | null
+): string | null {
   const bodyStr = responseBodyToString(responseBody);
   const creditsExhausted = isCreditsExhausted(bodyStr);
   const accountDeactivated = isAccountDeactivated(bodyStr);
   const oauthInvalid = isOAuthInvalidToken(bodyStr);
+  const preserveQuota429 = shouldPreserveQuotaSignalsFor429(provider);
 
-  if (
-    creditsExhausted &&
-    (statusCode === 400 || statusCode === 402 || statusCode === 429 || statusCode === 403)
-  ) {
+  if (creditsExhausted && [400, 402, 403].includes(statusCode)) {
     return PROVIDER_ERROR_TYPES.QUOTA_EXHAUSTED;
   }
 
+  if (creditsExhausted && statusCode === 429 && preserveQuota429) {
+    return PROVIDER_ERROR_TYPES.QUOTA_EXHAUSTED;
+  }
+
+  // API-key providers route 429 cooldowns through the resilience-aware fallback layer.
+  // OAuth providers keep their existing quota semantics because some of them encode
+  // longer quota windows as 429 responses.
   if (statusCode === 429) {
+    if (preserveQuota429 && isDailyQuotaExhausted(bodyStr)) {
+      return PROVIDER_ERROR_TYPES.QUOTA_EXHAUSTED;
+    }
     return PROVIDER_ERROR_TYPES.RATE_LIMITED;
   }
 
@@ -119,6 +142,9 @@ export function classifyProviderError(statusCode: number, responseBody: unknown)
   if (statusCode === 403) {
     if (bodyStr.includes("has not been used in project")) {
       return PROVIDER_ERROR_TYPES.PROJECT_ROUTE_ERROR;
+    }
+    if (provider && getProviderCategory(provider) === "apikey") {
+      return null;
     }
     return PROVIDER_ERROR_TYPES.FORBIDDEN;
   }

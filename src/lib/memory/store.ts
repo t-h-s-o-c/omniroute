@@ -3,7 +3,11 @@
  */
 
 import { getDbInstance } from "../db/core";
+import { upsertSemanticMemoryPoint, deleteSemanticMemoryPoint } from "./qdrant";
 import { Memory, MemoryType } from "./types";
+import { logger } from "../../../open-sse/utils/logger.ts";
+
+const log = logger("MEMORY_STORE");
 
 interface CacheEntry<T> {
   value: T;
@@ -74,15 +78,96 @@ function rowToMemory(row: MemoryRow): Memory {
 }
 
 /**
- * Create a new memory entry
+ * Find existing memory by apiKeyId and key (for UPSERT logic)
+ */
+function findExistingMemory(
+  db: ReturnType<typeof getDbInstance>,
+  apiKeyId: string,
+  key: string
+): MemoryRow | undefined {
+  if (!key) return undefined;
+  const stmt = db.prepare(
+    "SELECT * FROM memories WHERE api_key_id = ? AND key = ? ORDER BY created_at DESC LIMIT 1"
+  );
+  return stmt.get(apiKeyId, key) as MemoryRow | undefined;
+}
+
+/**
+ * Create a new memory entry (UPSERT: updates existing if same apiKeyId + key)
  */
 export async function createMemory(
   memory: Omit<Memory, "id" | "createdAt" | "updatedAt">
 ): Promise<Memory> {
   const db = getDbInstance();
-  const id = crypto.randomUUID();
   const now = new Date().toISOString();
 
+  // Check for existing memory with same apiKeyId + key (UPSERT logic)
+  const existing = memory.key ? findExistingMemory(db, memory.apiKeyId, memory.key) : undefined;
+
+  if (existing) {
+    // UPDATE existing record
+    const updatedMetadata = { ...parseJSON(existing.metadata), ...memory.metadata };
+    const stmt = db.prepare(
+      "UPDATE memories SET content = ?, metadata = ?, updated_at = ?, session_id = ?, type = ?, expires_at = ? WHERE id = ?"
+    );
+    stmt.run(
+      memory.content,
+      JSON.stringify(updatedMetadata),
+      now,
+      memory.sessionId,
+      memory.type,
+      memory.expiresAt ?? null,
+      existing.id
+    );
+
+    const updatedMemory: Memory = {
+      id: String(existing.id),
+      apiKeyId: memory.apiKeyId,
+      sessionId: memory.sessionId,
+      type: memory.type,
+      key: memory.key,
+      content: memory.content,
+      metadata: updatedMetadata,
+      createdAt: new Date(String(existing.created_at)),
+      updatedAt: new Date(now),
+      expiresAt: memory.expiresAt ?? null,
+    };
+
+    // Invalidate and update cache
+    invalidateMemoryCache(existing.id);
+    evictIfNeeded(_memoryCache);
+    _memoryCache.set(existing.id, { value: updatedMemory, timestamp: Date.now() });
+
+    log.info("memory.updated", {
+      apiKeyId: memory.apiKeyId,
+      type: memory.type,
+      id: existing.id,
+      key: memory.key,
+    });
+
+    // Best-effort re-sync to Qdrant after update
+    upsertSemanticMemoryPoint({
+      id: String(existing.id),
+      apiKeyId: memory.apiKeyId || "",
+      sessionId: memory.sessionId || "",
+      key: memory.key || "",
+      content: memory.content,
+      metadata: updatedMetadata || {},
+      createdAt: String(existing.created_at),
+      expiresAt: memory.expiresAt ? memory.expiresAt.toISOString() : null,
+    })
+      .then((r) => {
+        if (r.ok) log.debug?.("qdrant.upsert.ok", { id: existing.id, latencyMs: r.latencyMs });
+        else if (r.error && r.error !== "not_configured")
+          log.warn?.("qdrant.upsert.fail", { id: existing.id, error: r.error });
+      })
+      .catch((e) => log.warn?.("qdrant.upsert.error", { id: existing.id, error: String(e) }));
+
+    return updatedMemory;
+  }
+
+  // INSERT new record if not exists
+  const id = crypto.randomUUID();
   const stmt = db.prepare(
     "INSERT INTO memories (id, api_key_id, session_id, type, key, content, metadata, created_at, updated_at, expires_at) " +
       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -118,6 +203,26 @@ export async function createMemory(
   invalidateMemoryCache(id);
   evictIfNeeded(_memoryCache);
   _memoryCache.set(id, { value: createdMemory, timestamp: Date.now() });
+
+  log.info("memory.stored", { apiKeyId: memory.apiKeyId, type: memory.type, id });
+
+  // Best-effort sync to semantic memory store (Qdrant). Failures do not block the SQLite write.
+  upsertSemanticMemoryPoint({
+    id,
+    apiKeyId: memory.apiKeyId || "",
+    sessionId: memory.sessionId || "",
+    key: memory.key || "",
+    content: memory.content,
+    metadata: memory.metadata || {},
+    createdAt: now,
+    expiresAt: memory.expiresAt ? memory.expiresAt.toISOString() : null,
+  })
+    .then((r) => {
+      if (r.ok) log.debug?.("qdrant.upsert.ok", { id, latencyMs: r.latencyMs });
+      else if (r.error && r.error !== "not_configured")
+        log.warn?.("qdrant.upsert.fail", { id, error: r.error });
+    })
+    .catch((e) => log.warn?.("qdrant.upsert.error", { id, error: String(e) }));
 
   return createdMemory;
 }
@@ -228,63 +333,96 @@ export async function deleteMemory(id: string): Promise<boolean> {
   // Invalidate cache for this memory
   invalidateMemoryCache(id);
 
+  log.info("memory.deleted", { id });
+
   return true;
 }
 
 /**
- * List memories with optional filtering
+ * List memories with optional filtering and pagination
  */
 export async function listMemories(filters: {
   apiKeyId?: string;
   type?: MemoryType;
   sessionId?: string;
+  query?: string;
   limit?: number;
   offset?: number;
-}): Promise<Memory[]> {
+  page?: number;
+}): Promise<{ data: Memory[]; total: number; byType: Record<string, number> }> {
   const db = getDbInstance();
 
-  // Build dynamic query
-  let query = "SELECT * FROM memories";
-  const params: unknown[] = [];
+  // Build dynamic query conditions
   const whereClauses: string[] = [];
+  const whereParams: unknown[] = [];
 
   if (filters.apiKeyId) {
     whereClauses.push("api_key_id = ?");
-    params.push(filters.apiKeyId);
+    whereParams.push(filters.apiKeyId);
   }
 
   if (filters.type) {
     whereClauses.push("type = ?");
-    params.push(filters.type);
+    whereParams.push(filters.type);
   }
 
   if (filters.sessionId) {
     whereClauses.push("session_id = ?");
-    params.push(filters.sessionId);
+    whereParams.push(filters.sessionId);
   }
 
+  if (typeof filters.query === "string" && filters.query.trim().length > 0) {
+    const likeQuery = `%${filters.query.trim().toLowerCase()}%`;
+    whereClauses.push("(LOWER(content) LIKE ? OR LOWER(key) LIKE ?)");
+    whereParams.push(likeQuery, likeQuery);
+  }
+
+  // Run COUNT query + byType aggregation in a single query
+  let countQuery = "SELECT COUNT(*) as total FROM memories";
+  if (whereClauses.length > 0) {
+    countQuery += " WHERE " + whereClauses.join(" AND ");
+  }
+  const countStmt = db.prepare(countQuery);
+  const countRow = countStmt.get(...whereParams) as { total: number };
+  const total = countRow.total;
+
+  // Build byType aggregation (counts ALL matching rows, not just the page)
+  let byTypeQuery = "SELECT type, COUNT(*) as count FROM memories";
+  const byTypeParams: unknown[] = [...whereParams];
+  if (whereClauses.length > 0) {
+    byTypeQuery += " WHERE " + whereClauses.join(" AND ");
+  }
+  byTypeQuery += " GROUP BY type";
+  const byTypeStmt = db.prepare(byTypeQuery);
+  const byTypeRows = byTypeStmt.all(...byTypeParams) as { type: string; count: number }[];
+  const byType = Object.fromEntries(byTypeRows.map((r) => [r.type, r.count])) as Record<
+    string,
+    number
+  >;
+
+  // Calculate effective limit and offset
+  const effectiveLimit = filters.limit ?? 50;
+  const effectivePage = filters.page ?? 1;
+  const effectiveOffset = filters.offset ?? (effectivePage - 1) * effectiveLimit;
+
+  // Build SELECT query with pagination
+  let query = "SELECT * FROM memories";
   if (whereClauses.length > 0) {
     query += " WHERE " + whereClauses.join(" AND ");
   }
 
   // Add ordering and pagination
-  query += " ORDER BY created_at DESC";
+  query += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
 
-  if (filters.limit !== undefined) {
-    query += " LIMIT ?";
-    params.push(filters.limit);
-  }
-
-  if (filters.offset !== undefined) {
-    if (filters.limit === undefined) {
-      query += " LIMIT -1";
-    }
-    query += " OFFSET ?";
-    params.push(filters.offset);
-  }
+  // Build params for SELECT query (WHERE params + pagination params)
+  const params = [...whereParams, effectiveLimit, effectiveOffset];
 
   const stmt = db.prepare(query);
   const rows = stmt.all(...params);
 
-  return (rows as MemoryRow[]).map(rowToMemory);
+  return {
+    data: (rows as MemoryRow[]).map(rowToMemory),
+    total,
+    byType,
+  };
 }

@@ -1,6 +1,12 @@
-import { CORS_ORIGIN } from "@/shared/utils/cors";
 import { PROVIDER_MODELS } from "@/shared/constants/models";
-import { getAllCustomModels, getSyncedAvailableModels } from "@/lib/db/models";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
+import {
+  getAllCustomModels,
+  getAllSyncedAvailableModels,
+  getSyncedAvailableModels,
+} from "@/lib/db/models";
+import { getResolvedModelCapabilities } from "@/lib/modelCapabilities";
+import { getSyncedCapabilities } from "@/lib/modelsDevSync";
 
 /**
  * Handle CORS preflight
@@ -8,7 +14,6 @@ import { getAllCustomModels, getSyncedAvailableModels } from "@/lib/db/models";
 export async function OPTIONS() {
   return new Response(null, {
     headers: {
-      "Access-Control-Allow-Origin": CORS_ORIGIN,
       "Access-Control-Allow-Methods": "GET, OPTIONS",
       "Access-Control-Allow-Headers": "*",
     },
@@ -21,18 +26,21 @@ export async function OPTIONS() {
  */
 export async function GET() {
   try {
+    getSyncedCapabilities();
     const models = [];
 
     // Built-in models (hardcoded defaults)
     for (const [provider, providerModels] of Object.entries(PROVIDER_MODELS)) {
       for (const model of providerModels) {
+        const resolved = getResolvedModelCapabilities({ provider, model: model.id });
         models.push({
           name: `models/${provider}/${model.id}`,
           displayName: model.name || model.id,
           description: `${provider} model: ${model.name || model.id}`,
           supportedGenerationMethods: ["generateContent"],
-          inputTokenLimit: 128000,
-          outputTokenLimit: 8192,
+          inputTokenLimit: resolved.maxInputTokens || resolved.contextWindow || 128000,
+          outputTokenLimit: resolved.maxOutputTokens || 8192,
+          ...(resolved.supportsThinking === true ? { thinking: true } : {}),
         });
       }
     }
@@ -64,6 +72,46 @@ export async function GET() {
       console.error("[v1beta/models] Error fetching synced Gemini models:", err);
     }
 
+    const existingNames = new Set(models.map((model) => (model as any).name));
+
+    // Synced/imported models for non-Gemini providers
+    try {
+      const syncedModelsMap = await getAllSyncedAvailableModels();
+      for (const [providerId, syncedModels] of Object.entries(syncedModelsMap)) {
+        if (providerId === "gemini") continue;
+        if (!Array.isArray(syncedModels)) continue;
+        for (const m of syncedModels) {
+          if (!m || typeof m.id !== "string") continue;
+          const name = `models/${providerId}/${m.id}`;
+          if (existingNames.has(name)) continue;
+          const resolved = getResolvedModelCapabilities({
+            provider: providerId,
+            model: m.id,
+          });
+          models.push({
+            name,
+            displayName: m.name || m.id,
+            ...(typeof m.description === "string" ? { description: m.description } : {}),
+            supportedGenerationMethods: ["generateContent"],
+            inputTokenLimit:
+              typeof m.inputTokenLimit === "number"
+                ? m.inputTokenLimit
+                : resolved.maxInputTokens || resolved.contextWindow || 128000,
+            outputTokenLimit:
+              typeof m.outputTokenLimit === "number"
+                ? m.outputTokenLimit
+                : resolved.maxOutputTokens || 8192,
+            ...(m.supportsThinking === true || resolved.supportsThinking === true
+              ? { thinking: true }
+              : {}),
+          });
+          existingNames.add(name);
+        }
+      }
+    } catch {
+      // Synced models are optional — skip on error
+    }
+
     // Custom models (use stored metadata from provider APIs)
     try {
       const customModelsMap = (await getAllCustomModels()) as Record<string, unknown>;
@@ -76,15 +124,30 @@ export async function GET() {
             continue;
           const m = model as Record<string, unknown>;
           if (m.isHidden === true) continue;
+          const resolved = getResolvedModelCapabilities({
+            provider: providerId,
+            model: String(m.id),
+          });
+          const name = `models/${providerId}/${m.id}`;
+          if (existingNames.has(name)) continue;
           models.push({
-            name: `models/${providerId}/${m.id}`,
+            name,
             displayName: m.name || m.id,
             ...(typeof m.description === "string" ? { description: m.description } : {}),
             supportedGenerationMethods: ["generateContent"],
-            inputTokenLimit: typeof m.inputTokenLimit === "number" ? m.inputTokenLimit : 128000,
-            outputTokenLimit: typeof m.outputTokenLimit === "number" ? m.outputTokenLimit : 8192,
-            ...(m.supportsThinking === true ? { thinking: true } : {}),
+            inputTokenLimit:
+              typeof m.inputTokenLimit === "number"
+                ? m.inputTokenLimit
+                : resolved.maxInputTokens || resolved.contextWindow || 128000,
+            outputTokenLimit:
+              typeof m.outputTokenLimit === "number"
+                ? m.outputTokenLimit
+                : resolved.maxOutputTokens || 8192,
+            ...(m.supportsThinking === true || resolved.supportsThinking === true
+              ? { thinking: true }
+              : {}),
           });
+          existingNames.add(name);
         }
       }
     } catch {
@@ -94,6 +157,6 @@ export async function GET() {
     return Response.json({ models });
   } catch (error: any) {
     console.log("Error fetching models:", error);
-    return Response.json({ error: { message: error.message } }, { status: 500 });
+    return Response.json({ error: { message: sanitizeErrorMessage(error) } }, { status: 500 });
   }
 }

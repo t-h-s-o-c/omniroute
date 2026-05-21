@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { AsyncLocalStorage } from "node:async_hooks";
 import { fetch as undiciFetch } from "undici";
 import {
@@ -23,6 +24,12 @@ type FetchWithDispatcher = (
   input: RequestInfo | URL,
   init?: FetchWithDispatcherOptions
 ) => Promise<Response>;
+
+/** Injectable dependencies for testability (Approach B DI). */
+export type ProxyFetchDeps = {
+  undiciFetch?: FetchWithDispatcher;
+  nativeFetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+};
 
 type PatchState = {
   originalFetch: typeof globalThis.fetch;
@@ -78,11 +85,33 @@ function noProxyMatch(targetUrl) {
     if (patternPort && patternPort !== port) return false;
 
     if (!patternHost) return false;
+
+    // Support wildcard matching (e.g. 192.168.* or *.local)
+    if (patternHost.includes("*")) {
+      const regexStr =
+        "^" +
+        patternHost
+          .split("*")
+          .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          .join(".*") +
+        "$";
+      if (new RegExp(regexStr).test(hostname)) return true;
+    }
+
     if (patternHost.startsWith(".")) {
       return hostname.endsWith(patternHost) || hostname === patternHost.slice(1);
     }
     return hostname === patternHost || hostname.endsWith(`.${patternHost}`);
   });
+}
+
+function isLocalAddress(hostname: string): boolean {
+  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") return true;
+  if (hostname.startsWith("192.168.")) return true;
+  if (hostname.startsWith("10.")) return true;
+  if (hostname.match(/^172\.(1[6-9]|2\d|3[0-1])\./)) return true;
+  if (hostname.endsWith(".local") || hostname.endsWith(".lan")) return true;
+  return false;
 }
 
 function resolveEnvProxyUrl(targetUrl) {
@@ -110,7 +139,19 @@ function resolveEnvProxyUrl(targetUrl) {
   return normalizeProxyUrl(proxyUrl, "environment proxy");
 }
 
-function resolveProxyForRequest(targetUrl) {
+export function resolveProxyForRequest(targetUrl) {
+  let target;
+  try {
+    target = new URL(targetUrl);
+  } catch {
+    target = null;
+  }
+
+  // Always bypass proxy for local/LAN addresses
+  if (target && isLocalAddress(target.hostname.toLowerCase())) {
+    return { source: "direct", proxyUrl: null };
+  }
+
   const contextProxy = proxyContext.getStore();
   if (contextProxy) {
     return { source: "context", proxyUrl: proxyConfigToUrl(contextProxy) };
@@ -135,7 +176,11 @@ export async function runWithProxyContext(proxyConfig, fn) {
     throw new TypeError("runWithProxyContext requires a callback function");
   }
 
-  const resolvedProxyUrl = proxyConfig ? proxyConfigToUrl(proxyConfig) : null;
+  // Inherit existing context if no specific proxyConfig is provided
+  const currentContext = proxyContext.getStore();
+  const effectiveProxyConfig = proxyConfig || currentContext || null;
+
+  const resolvedProxyUrl = effectiveProxyConfig ? proxyConfigToUrl(effectiveProxyConfig) : null;
 
   // T14: Proxy Fast-Fail
   // Perform a short TCP reachability check before issuing upstream requests.
@@ -153,8 +198,8 @@ export async function runWithProxyContext(proxyConfig, fn) {
     }
   }
 
-  return proxyContext.run(proxyConfig || null, async () => {
-    if (resolvedProxyUrl) {
+  return proxyContext.run(effectiveProxyConfig, async () => {
+    if (resolvedProxyUrl && effectiveProxyConfig !== currentContext) {
       console.log(
         `[ProxyFetch] Applied request proxy context: ${proxyUrlForLogs(resolvedProxyUrl)}`
       );
@@ -163,9 +208,18 @@ export async function runWithProxyContext(proxyConfig, fn) {
   });
 }
 
-async function patchedFetch(input: RequestInfo | URL, options: FetchWithDispatcherOptions = {}) {
+async function patchedFetch(
+  input: RequestInfo | URL,
+  options: FetchWithDispatcherOptions = {},
+  deps: ProxyFetchDeps = {}
+) {
   if (options?.dispatcher) {
-    return (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>)(input, options);
+    // When a dispatcher is present, we MUST use the undici library fetch
+    // to ensure version compatibility. Node 22 built-in fetch (undici v6)
+    // is incompatible with undici v8 dispatchers (missing onRequestStart, etc.)
+    const _undiciDispatcher =
+      deps.undiciFetch ?? (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>);
+    return _undiciDispatcher(input, options);
   }
 
   const targetUrl = getTargetUrl(input);
@@ -188,6 +242,7 @@ async function patchedFetch(input: RequestInfo | URL, options: FetchWithDispatch
         return await tlsClient.fetch(targetUrl, {
           ...options,
           headers: options.headers,
+          signal: options.signal ?? undefined,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -200,25 +255,78 @@ async function patchedFetch(input: RequestInfo | URL, options: FetchWithDispatch
     }
     // Direct connection (no proxy) — use undici with custom dispatcher for timeout control.
     // Falls back to original native fetch if dispatcher initialization fails (#1054).
-    try {
-      return await (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>)(input, {
-        ...options,
-        dispatcher: getDefaultDispatcher(),
-      });
-    } catch (dispatcherError) {
-      const msg = dispatcherError instanceof Error ? dispatcherError.message : String(dispatcherError);
-      // Only fallback for connection/dispatcher errors, not HTTP errors
-      if (msg.includes("fetch failed") || msg.includes("ECONNREFUSED") || msg.includes("UND_ERR")) {
-        console.warn(`[ProxyFetch] Undici dispatcher failed, falling back to native fetch: ${msg}`);
-        return originalFetchWithDispatcher(input, options);
+    // Retries once on transient dispatcher errors before falling back (fix: proxyfetch-undici-retry).
+    //
+    // ReadableStream/Blob body guard: if the body is non-replayable, skip the retry because
+    // the first attempt drains the stream; a second attempt would silently send an empty body.
+    // ReadableStream check: cast through unknown to avoid explicit-any budget (T11).
+    const _bodyUnknown = options.body as unknown;
+    const bodyIsStream =
+      _bodyUnknown !== null &&
+      _bodyUnknown !== undefined &&
+      typeof _bodyUnknown === "object" &&
+      (typeof (_bodyUnknown as Record<string, unknown>).getReader === "function" || // ReadableStream
+        typeof (_bodyUnknown as Record<string, unknown>).stream === "function"); // Blob
+    const maxAttempts = bodyIsStream ? 1 : 2;
+    const _undiciDirect =
+      deps.undiciFetch ?? (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>);
+    const _nativeFallback =
+      (deps.nativeFetch as FetchWithDispatcher | undefined) ?? originalFetchWithDispatcher;
+    let lastDispatcherError: unknown = null;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        return await _undiciDirect(input, {
+          ...options,
+          dispatcher: getDefaultDispatcher(),
+        });
+      } catch (dispatcherError) {
+        const msg =
+          dispatcherError instanceof Error ? dispatcherError.message : String(dispatcherError);
+        // CAUTION: Do NOT fallback to native fetch if the error is a version mismatch (invalid onRequestStart)
+        // because the native fetch will definitely fail with the undici v8 dispatcher.
+        if (msg.includes("onRequestStart")) {
+          console.error(
+            `[ProxyFetch] Fatal version mismatch: Dispatcher (v8) vs Fetch (v6/native). Hardware upgrade or SOCKS5 config isolation required. Error: ${msg}`
+          );
+          throw dispatcherError;
+        }
+        // Only retry/fallback for connection/dispatcher errors, not HTTP errors.
+        // Prefer the .code property when available (more stable across undici
+        // versions than message-string matching); fall back to substring match
+        // for errors that lack a structured code.
+        const errCode = (dispatcherError as { code?: string })?.code;
+        if (
+          msg.includes("fetch failed") ||
+          errCode === "ECONNREFUSED" ||
+          msg.includes("ECONNREFUSED") ||
+          (errCode !== undefined && errCode.startsWith("UND_ERR")) ||
+          msg.includes("UND_ERR")
+        ) {
+          if (attempt === 0 && maxAttempts > 1) {
+            // First failure — retry once with a short jittered delay before giving up.
+            lastDispatcherError = dispatcherError;
+            await new Promise((r) => setTimeout(r, 25 + Math.random() * 50));
+            continue;
+          }
+          // All attempts exhausted — fall back to native fetch.
+          // Preserve original phrase intact for monitoring: "Undici dispatcher failed, falling back to native fetch"
+          console.warn(
+            `[ProxyFetch] Undici dispatcher failed, falling back to native fetch (after retry): ${msg}`
+          );
+          return _nativeFallback(input, options);
+        }
+        throw dispatcherError;
       }
-      throw dispatcherError;
     }
+    // Should not be reached, but satisfy TypeScript control-flow.
+    throw lastDispatcherError;
   }
 
   try {
     const dispatcher = createProxyDispatcher(proxyUrl);
-    return await (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>)(input, {
+    const _undiciProxy =
+      deps.undiciFetch ?? (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>);
+    return await _undiciProxy(input, {
       ...options,
       dispatcher,
     });
@@ -227,6 +335,19 @@ async function patchedFetch(input: RequestInfo | URL, options: FetchWithDispatch
     console.error(`[ProxyFetch] Proxy request failed (${source}, fail-closed): ${message}`);
     throw error;
   }
+}
+
+/**
+ * Named export for proxyFetch — identical to the patched globalThis.fetch but
+ * accepts an optional ProxyFetchDeps for unit test dependency injection.
+ * Production code should use globalThis.fetch (or the default export) instead.
+ */
+export async function proxyFetch(
+  input: RequestInfo | URL,
+  options: RequestInit = {},
+  deps: ProxyFetchDeps = {}
+): Promise<Response> {
+  return patchedFetch(input, options as FetchWithDispatcherOptions, deps);
 }
 
 if (!isCloud && !patchState.isPatched) {

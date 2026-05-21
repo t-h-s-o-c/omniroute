@@ -2,9 +2,8 @@
 
 import { useTranslations } from "next-intl";
 
-import { useState, useEffect, useMemo, useCallback } from "react";
-import PropTypes from "prop-types";
-import Image from "next/image";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Card, CardSkeleton, Button, Modal } from "@/shared/components";
@@ -13,10 +12,56 @@ import { AI_PROVIDERS, FREE_PROVIDERS, OAUTH_PROVIDERS } from "@/shared/constant
 import { useNotificationStore } from "@/store/notificationStore";
 import { copyToClipboard } from "@/shared/utils/clipboard";
 
+const ProviderTopology = dynamic(() => import("../home/ProviderTopology"), { ssr: false });
+import type { NewsAnnouncement } from "@/shared/utils/releaseNotes";
+
 type UpdateStep = {
   step: string;
   status: string;
   message: string;
+};
+
+type VersionInfo = {
+  current: string;
+  latest: string;
+  updateAvailable: boolean;
+  channel: string;
+  autoUpdateSupported: boolean;
+  autoUpdateError?: string | null;
+  news?: NewsAnnouncement | null;
+};
+
+type HomePageClientProps = {
+  machineId?: string;
+};
+
+type ProviderSummaryItem = {
+  id: string;
+  provider: {
+    id: string;
+    name: string;
+    color?: string;
+    textIcon?: string;
+    alias?: string;
+  };
+  total: number;
+  connected: number;
+  errors: number;
+  modelCount: number;
+  authType: "free" | "oauth" | "apikey" | string;
+};
+
+type ProviderMetricSummary = {
+  totalRequests?: number;
+  totalSuccesses?: number;
+  successRate?: number;
+  avgLatencyMs?: number;
+};
+
+type ProviderModelSummary = {
+  fullModel: string;
+  alias?: string;
+  model?: string;
 };
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -32,10 +77,12 @@ function mergeUpdateStep(steps: UpdateStep[], nextStep: UpdateStep) {
   return next;
 }
 
-export default function HomePageClient({ machineId }) {
+export default function HomePageClient({ machineId }: HomePageClientProps) {
+  const router = useRouter();
   const t = useTranslations("home");
   const tc = useTranslations("common");
   const ts = useTranslations("sidebar");
+  const tp = useTranslations("providers");
   const [providerConnections, setProviderConnections] = useState([]);
   const [models, setModels] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -43,7 +90,7 @@ export default function HomePageClient({ machineId }) {
   const [selectedProvider, setSelectedProvider] = useState(null);
   const [providerMetrics, setProviderMetrics] = useState({});
 
-  const [versionInfo, setVersionInfo] = useState<any>(null);
+  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [updating, setUpdating] = useState(false);
   const [updateSteps, setUpdateSteps] = useState<UpdateStep[]>([]);
   const [updatePhase, setUpdatePhase] = useState<"idle" | "running" | "done" | "failed">("idle");
@@ -88,6 +135,94 @@ export default function HomePageClient({ machineId }) {
   useEffect(() => {
     fetchData();
   }, [fetchData]);
+
+  // T07: Check for unhealthy API keys and show notification (once per session)
+  const notifiedUnhealthyKeys = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const checkApiKeyHealth = () => {
+      const newUnhealthyKeys = new Set<string>();
+      const unhealthyProviderIds = new Set<string>();
+      const unhealthyConnections: string[] = [];
+      let firstUnhealthyProviderId: string | null = null;
+      let hasWarning = false;
+
+      for (const conn of providerConnections) {
+        const health = conn.providerSpecificData?.apiKeyHealth as
+          | Record<
+              string,
+              {
+                status: "active" | "warning" | "invalid";
+                failures: number;
+                lastFailure: string | null;
+              }
+            >
+          | undefined;
+        if (!health) continue;
+
+        // Defense-in-depth: skip stale extra_N health entries whose index
+        // is out of range of the current extraApiKeys list.
+        // The backend cleans this up on PATCH, but existing stale data from
+        // before the fix or other code paths could still have orphan entries.
+        const extras: string[] = conn.providerSpecificData?.extraApiKeys ?? [];
+        const extraKeyCount = Array.isArray(extras) ? extras.length : 0;
+
+        const unhealthyKeys = Object.entries(health).filter(([keyId, h]) => {
+          if (h.status !== "invalid" && h.status !== "warning") return false;
+          // extra_N entries: only flag if the index is still within bounds
+          if (keyId.startsWith("extra_")) {
+            const idx = parseInt(keyId.slice(6), 10);
+            if (isNaN(idx) || idx >= extraKeyCount) return false;
+          }
+          return true;
+        });
+
+        if (unhealthyKeys.length > 0) {
+          for (const [, h] of unhealthyKeys) {
+            if (h.status === "warning") hasWarning = true;
+            break;
+          }
+          for (const [keyId] of unhealthyKeys) {
+            newUnhealthyKeys.add(`${conn.id}:${keyId}`);
+          }
+          if (firstUnhealthyProviderId === null) {
+            firstUnhealthyProviderId = conn.provider;
+          }
+          unhealthyConnections.push(conn.name || conn.id);
+          unhealthyProviderIds.add(conn.provider);
+        }
+      }
+
+      // Only notify for newly unhealthy keys (not already notified)
+      const hasNewUnhealthy = Array.from(newUnhealthyKeys).some(
+        (k) => !notifiedUnhealthyKeys.current.has(k)
+      );
+      if (hasNewUnhealthy) {
+        const navigateTo =
+          newUnhealthyKeys.size === 1 && firstUnhealthyProviderId
+            ? `/dashboard/providers/${firstUnhealthyProviderId}`
+            : `/dashboard/providers?search=${encodeURIComponent(Array.from(unhealthyProviderIds).join(" "))}`;
+
+        const notificationType = hasWarning ? "warning" : "error";
+
+        useNotificationStore.getState().addNotification({
+          type: notificationType,
+          message: tp(hasWarning ? "apiKeyWarningAlert" : "apiKeyInvalidAlert", {
+            count: newUnhealthyKeys.size,
+            connections: unhealthyConnections.join(", "),
+          }),
+          title: tp(hasWarning ? "apiKeyWarningAlertTitle" : "apiKeyInvalidAlertTitle"),
+          duration: 10000,
+          onClick: () => router.push(navigateTo),
+        });
+        // Mark all current unhealthy keys as notified
+        newUnhealthyKeys.forEach((k) => notifiedUnhealthyKeys.current.add(k));
+      }
+    };
+
+    if (providerConnections.length > 0) {
+      checkApiKeyHealth();
+    }
+  }, [providerConnections, t, tp, router]);
 
   const providerStats = useMemo(() => {
     return Object.entries(AI_PROVIDERS).map(([providerId, providerInfo]) => {
@@ -135,21 +270,6 @@ export default function HomePageClient({ machineId }) {
     );
     return models.filter((m) => providerKeys.has(m.provider));
   }, [selectedProvider, models]);
-
-  const quickStartLinks = [
-    { label: t("documentation"), href: "/docs", icon: "menu_book" },
-    { label: ts("providers"), href: "/dashboard/providers", icon: "dns" },
-    { label: ts("combos"), href: "/dashboard/combos", icon: "layers" },
-    { label: ts("analytics"), href: "/dashboard/analytics", icon: "analytics" },
-    { label: t("healthMonitor"), href: "/dashboard/health", icon: "health_and_safety" },
-    { label: ts("cliTools"), href: "/dashboard/cli-tools", icon: "terminal" },
-    {
-      label: t("reportIssue"),
-      href: "https://github.com/diegosouzapw/OmniRoute/issues",
-      external: true,
-      icon: "bug_report",
-    },
-  ];
 
   const pollBackgroundUpdate = useCallback(
     async ({
@@ -507,7 +627,7 @@ export default function HomePageClient({ machineId }) {
                     <span className="material-symbols-outlined text-[18px]">check_circle</span>
                     {updateSteps.find((s) => s.step === "complete")?.message || "Update complete!"}
                   </p>
-                  <p className="text-xs text-text-muted mt-1">Reloading page automatically...</p>
+                  <p className="text-xs text-text-muted mt-1">{t("reloadingPageAutomatically")}</p>
                 </div>
               )}
             </div>
@@ -540,29 +660,64 @@ export default function HomePageClient({ machineId }) {
 
       {/* Update Notification Banner */}
       {versionInfo?.updateAvailable && !showUpdateOverlay && (
-        <div className="bg-primary/10 border border-primary/20 text-primary px-5 py-4 rounded-xl flex items-center justify-between min-h-[64px]">
-          <div className="flex items-center gap-4">
-            <span className="material-symbols-outlined text-[24px]">system_update_alt</span>
-            <div>
-              <p className="font-semibold text-sm">Update Available: v{versionInfo.latest}</p>
-              <p className="text-xs opacity-80 mt-0.5">
-                {versionInfo.autoUpdateSupported
-                  ? t("updateAvailableDesc") ||
-                    `You are currently using v${versionInfo.current}. Update to access the latest features and bug fixes.`
-                  : versionInfo.autoUpdateError ||
-                    "Manual update required for this installation type."}
-              </p>
+        <div className="flex flex-col gap-3">
+          <div className="flex min-h-[64px] items-center justify-between rounded-lg border border-primary/20 bg-primary/10 px-5 py-4 text-primary">
+            <div className="flex min-w-0 items-center gap-4">
+              <span className="material-symbols-outlined shrink-0 text-[24px]">
+                system_update_alt
+              </span>
+              <div>
+                <p className="font-semibold text-sm">Update Available: v{versionInfo.latest}</p>
+                <p className="text-xs opacity-80 mt-0.5">
+                  {versionInfo.autoUpdateSupported
+                    ? t("updateAvailableDesc") ||
+                      `You are currently using v${versionInfo.current}. Update to access the latest features and bug fixes.`
+                    : versionInfo.autoUpdateError ||
+                      "Manual update required for this installation type."}
+                </p>
+              </div>
             </div>
+            <Button
+              size="sm"
+              onClick={versionInfo.autoUpdateSupported ? handleUpdate : undefined}
+              disabled={updating || !versionInfo.autoUpdateSupported}
+              className="ml-4 shrink-0 font-semibold"
+              title={versionInfo.autoUpdateError || ""}
+            >
+              {versionInfo.autoUpdateSupported ? t("updateNow") || "Update Now" : "Manual Update"}
+            </Button>
           </div>
-          <Button
-            size="sm"
-            onClick={versionInfo.autoUpdateSupported ? handleUpdate : undefined}
-            disabled={updating || !versionInfo.autoUpdateSupported}
-            className="shrink-0 ml-4 font-semibold"
-            title={versionInfo.autoUpdateError || ""}
-          >
-            {versionInfo.autoUpdateSupported ? t("updateNow") || "Update Now" : "Manual Update"}
-          </Button>
+
+          {/* News Notification Banner */}
+          {versionInfo?.news && (
+            <div className="flex min-h-[64px] items-center justify-between rounded-lg border border-border bg-surface px-5 py-4">
+              <div className="flex min-w-0 items-center gap-4">
+                <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-bg text-text-muted">
+                  <span className="material-symbols-outlined text-[22px] text-primary">
+                    {versionInfo.news.icon || "campaign"}
+                  </span>
+                </div>
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-text-main">{versionInfo.news.title}</p>
+                  <p className="mt-0.5 max-w-[560px] text-xs leading-relaxed text-text-muted">
+                    {versionInfo.news.message}
+                  </p>
+                </div>
+              </div>
+
+              {versionInfo.news.link && (
+                <a
+                  href={versionInfo.news.link}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="ml-4 inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-border bg-bg px-4 py-2 text-xs font-semibold text-text-main transition-colors hover:border-primary/30 hover:text-primary"
+                >
+                  {versionInfo.news.linkLabel || "Ler Mais"}
+                  <span className="material-symbols-outlined text-[14px]">arrow_forward</span>
+                </a>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -636,7 +791,7 @@ export default function HomePageClient({ machineId }) {
                 <p className="text-text-muted mt-0.5">
                   {t.rich("step4Desc", {
                     logs: (chunks) => (
-                      <Link href="/dashboard/usage" className="text-primary hover:underline">
+                      <Link href="/dashboard/logs" className="text-primary hover:underline">
                         {chunks}
                       </Link>
                     ),
@@ -650,70 +805,35 @@ export default function HomePageClient({ machineId }) {
               </div>
             </li>
           </ol>
-
-          <div className="flex flex-wrap gap-2">
-            {quickStartLinks.map((link) => (
-              <a
-                key={link.href}
-                href={link.href}
-                target={link.external ? "_blank" : undefined}
-                rel={link.external ? "noopener noreferrer" : undefined}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-border text-text-muted hover:text-text-main hover:bg-bg-subtle transition-colors"
-              >
-                <span className="material-symbols-outlined text-[14px]">
-                  {link.icon || (link.external ? "open_in_new" : "arrow_forward")}
-                </span>
-                {link.label}
-              </a>
-            ))}
-          </div>
         </div>
       </Card>
 
-      {/* Providers Overview */}
+      {/* Provider Topology */}
       <Card>
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center justify-between mb-3">
           <div>
-            <h2 className="text-lg font-semibold">{t("providersOverview")}</h2>
-            <p className="text-sm text-text-muted">
-              {t("configuredOf", {
-                configured: providerStats.filter((item) => item.total > 0).length,
-                total: providerStats.length,
-              })}
+            <h2 className="text-base font-semibold">{t("providerTopology")}</h2>
+            <p className="text-xs text-text-muted">
+              Connected providers routing through OmniRoute in real time
             </p>
           </div>
-          <div className="flex items-center gap-4">
-            <div className="hidden sm:flex items-center gap-3 text-[11px] text-text-muted">
-              <span className="flex items-center gap-1">
-                <span className="size-2 rounded-full bg-green-500" /> {tc("free")}
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="size-2 rounded-full bg-blue-500" /> {t("oauthLabel")}
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="size-2 rounded-full bg-amber-500" /> {t("apiKeyLabel")}
-              </span>
-            </div>
-            <Link
-              href="/dashboard/providers"
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-border text-text-muted hover:text-text-main hover:bg-bg-subtle transition-colors"
-            >
-              <span className="material-symbols-outlined text-[14px]">settings</span>
-              {tc("manage")}
-            </Link>
+          <div className="flex items-center gap-3 text-[11px] text-text-muted">
+            <span className="flex items-center gap-1.5">
+              <span className="size-2 rounded-full bg-green-500" /> Active
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="size-2 rounded-full bg-amber-500" /> Recent
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="size-2 rounded-full bg-red-500" /> Error
+            </span>
           </div>
         </div>
-
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-          {providerStats.map((item) => (
-            <ProviderOverviewCard
-              key={item.id}
-              item={item}
-              metrics={providerMetrics[item.provider.alias] || providerMetrics[item.id]}
-              onClick={() => setSelectedProvider(item)}
-            />
-          ))}
-        </div>
+        <ProviderTopology
+          providers={providerStats
+            .filter((p) => p.total > 0)
+            .map((p) => ({ id: p.id, provider: p.id, name: p.provider.name }))}
+        />
       </Card>
 
       {/* Provider Models Modal */}
@@ -728,11 +848,15 @@ export default function HomePageClient({ machineId }) {
   );
 }
 
-HomePageClient.propTypes = {
-  machineId: PropTypes.string,
-};
-
-function ProviderOverviewCard({ item, metrics, onClick }) {
+function ProviderOverviewCard({
+  item,
+  metrics,
+  onClick,
+}: {
+  item: ProviderSummaryItem;
+  metrics?: ProviderMetricSummary;
+  onClick: () => void;
+}) {
   const t = useTranslations("home");
   const tc = useTranslations("common");
 
@@ -793,32 +917,15 @@ function ProviderOverviewCard({ item, metrics, onClick }) {
   );
 }
 
-ProviderOverviewCard.propTypes = {
-  item: PropTypes.shape({
-    id: PropTypes.string.isRequired,
-    provider: PropTypes.shape({
-      id: PropTypes.string.isRequired,
-      name: PropTypes.string.isRequired,
-      color: PropTypes.string,
-      textIcon: PropTypes.string,
-      alias: PropTypes.string,
-    }).isRequired,
-    total: PropTypes.number.isRequired,
-    connected: PropTypes.number.isRequired,
-    errors: PropTypes.number.isRequired,
-    modelCount: PropTypes.number.isRequired,
-    authType: PropTypes.string.isRequired,
-  }).isRequired,
-  metrics: PropTypes.shape({
-    totalRequests: PropTypes.number,
-    totalSuccesses: PropTypes.number,
-    successRate: PropTypes.number,
-    avgLatencyMs: PropTypes.number,
-  }),
-  onClick: PropTypes.func.isRequired,
-};
-
-function ProviderModelsModal({ provider, models, onClose }) {
+function ProviderModelsModal({
+  provider,
+  models,
+  onClose,
+}: {
+  provider: ProviderSummaryItem;
+  models: ProviderModelSummary[];
+  onClose: () => void;
+}) {
   const [copiedModel, setCopiedModel] = useState(null);
   const notify = useNotificationStore();
   const router = useRouter();
@@ -920,9 +1027,3 @@ function ProviderModelsModal({ provider, models, onClose }) {
     </Modal>
   );
 }
-
-ProviderModelsModal.propTypes = {
-  provider: PropTypes.object.isRequired,
-  models: PropTypes.array.isRequired,
-  onClose: PropTypes.func.isRequired,
-};

@@ -1,16 +1,59 @@
 import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { buildComboTestRequestBody, extractComboTestResponseText } from "@/lib/combos/testHealth";
-import { getComboByName } from "@/lib/localDb";
+import { getApiKeys, getComboByName, getCombos } from "@/lib/localDb";
+import { getRuntimePorts } from "@/lib/runtime/ports";
+import { resolveNestedComboTargets } from "@omniroute/open-sse/services/combo.ts";
 import { testComboSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
-async function testComboModel(modelStr, internalUrl) {
+async function getInternalApiKey(): Promise<string | null> {
+  try {
+    const keys = await getApiKeys();
+    const active = (
+      keys as Array<{ key: string; isActive?: boolean; revokedAt?: string | null }>
+    ).find((k) => k.key && k.isActive !== false && !k.revokedAt);
+    return active?.key ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function buildComboTestResult(target, partial = {}) {
+  return {
+    model: target.modelStr,
+    provider: target.provider,
+    stepId: target.stepId,
+    executionKey: target.executionKey,
+    connectionId: target.connectionId,
+    label: target.label,
+    ...partial,
+  };
+}
+
+async function testComboTarget(target, baseInternalUrl, internalApiKey: string | null) {
   const startTime = Date.now();
   try {
-    // Send a minimal but real chat request through the same internal
-    // endpoint an external OpenAI-compatible client would use.
-    const testBody = buildComboTestRequestBody(modelStr);
+    // Issue #2359: combo entries with a malformed/missing modelStr surfaced
+    // as `e.startsWith is not a function` / similar TypeError 500s. Coerce
+    // defensively at the boundary so the test path returns a clean error
+    // instead of crashing the request handler.
+    const modelStr = typeof target?.modelStr === "string" ? target.modelStr : "";
+    if (!modelStr) {
+      return buildComboTestResult(target, {
+        status: "error",
+        error: "Combo step is missing a model id (modelStr). Re-save the combo to refresh it.",
+        latencyMs: 0,
+      });
+    }
+    const modelLower = modelStr.toLowerCase();
+    const isEmbedding =
+      modelLower.includes("embedding") ||
+      modelLower.includes("bge-") ||
+      modelLower.includes("text-embed");
+    const internalUrl = `${baseInternalUrl}/v1/${isEmbedding ? "embeddings" : "chat/completions"}`;
+    const testBody = buildComboTestRequestBody(modelStr, isEmbedding);
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 20000);
@@ -21,12 +64,12 @@ async function testComboModel(modelStr, internalUrl) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          // Internal dashboard tests still use the normal /v1 pipeline but
-          // bypass REQUIRE_API_KEY so admins can test with local session auth.
+          ...(internalApiKey ? { Authorization: `Bearer ${internalApiKey}` } : {}),
           "X-Internal-Test": "combo-health-check",
           // Force a fresh execution path so combo tests cannot be satisfied by
           // OmniRoute's semantic cache or other request reuse layers.
           "X-OmniRoute-No-Cache": "true",
+          ...(target.connectionId ? { "X-OmniRoute-Connection": target.connectionId } : {}),
           "X-Request-Id": `combo-test-${randomUUID()}`,
         },
         body: JSON.stringify(testBody),
@@ -48,16 +91,15 @@ async function testComboModel(modelStr, internalUrl) {
 
       const responseText = extractComboTestResponseText(responseBody);
       if (!responseText) {
-        return {
-          model: modelStr,
+        return buildComboTestResult(target, {
           status: "error",
           statusCode: res.status,
           error: "Provider returned HTTP 200 but no text content.",
           latencyMs,
-        };
+        });
       }
 
-      return { model: modelStr, status: "ok", latencyMs, responseText };
+      return buildComboTestResult(target, { status: "ok", latencyMs, responseText });
     }
 
     let errorMsg = "";
@@ -68,21 +110,19 @@ async function testComboModel(modelStr, internalUrl) {
       errorMsg = res.statusText;
     }
 
-    return {
-      model: modelStr,
+    return buildComboTestResult(target, {
       status: "error",
       statusCode: res.status,
       error: errorMsg,
       latencyMs,
-    };
+    });
   } catch (error) {
     const latencyMs = Date.now() - startTime;
-    return {
-      model: modelStr,
+    return buildComboTestResult(target, {
       status: "error",
       error: error.name === "AbortError" ? "Timeout (20s)" : error.message,
       latencyMs,
-    };
+    });
   }
 }
 
@@ -92,6 +132,9 @@ async function testComboModel(modelStr, internalUrl) {
  * and only reports success when the model returns usable text content.
  */
 export async function POST(request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();
@@ -119,22 +162,36 @@ export async function POST(request) {
       return NextResponse.json({ error: "Combo not found" }, { status: 404 });
     }
 
-    const models = (combo.models || []).map((m) => (typeof m === "string" ? m : m.model));
+    const allCombos = await getCombos();
+    const targets = resolveNestedComboTargets(combo, allCombos);
 
-    if (models.length === 0) {
+    if (targets.length === 0) {
       return NextResponse.json({ error: "Combo has no models" }, { status: 400 });
     }
 
-    const internalUrl = `${getBaseUrl(request)}/v1/chat/completions`;
+    const baseInternalUrl = getInternalBaseUrl();
+    const internalApiKey = await getInternalApiKey();
     const results = await Promise.all(
-      models.map((modelStr) => testComboModel(modelStr, internalUrl))
+      targets.map((target) => testComboTarget(target, baseInternalUrl, internalApiKey))
     );
-    const resolvedBy = results.find((result) => result.status === "ok")?.model || null;
+    const resolvedResult = results.find((result) => result.status === "ok") || null;
+    const resolvedBy = resolvedResult?.model || null;
 
     return NextResponse.json({
       comboName,
       strategy: combo.strategy || "priority",
       resolvedBy,
+      resolvedByExecutionKey: resolvedResult?.executionKey || null,
+      resolvedByTarget: resolvedResult
+        ? {
+            model: resolvedResult.model,
+            provider: resolvedResult.provider,
+            stepId: resolvedResult.stepId,
+            executionKey: resolvedResult.executionKey,
+            connectionId: resolvedResult.connectionId,
+            label: resolvedResult.label,
+          }
+        : null,
       results,
       testedAt: new Date().toISOString(),
     });
@@ -144,13 +201,7 @@ export async function POST(request) {
   }
 }
 
-/**
- * Get the base URL for internal requests (VPS-safe: respects reverse proxy headers)
- */
-function getBaseUrl(request) {
-  const fwdHost = request.headers.get("x-forwarded-host");
-  const fwdProto = request.headers.get("x-forwarded-proto") || "https";
-  if (fwdHost) return `${fwdProto}://${fwdHost}`;
-  const url = new URL(request.url);
-  return `${url.protocol}//${url.host}`;
+function getInternalBaseUrl(): string {
+  const { apiPort } = getRuntimePorts();
+  return `http://127.0.0.1:${apiPort}`;
 }

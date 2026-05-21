@@ -13,7 +13,7 @@ interface ServiceAccount {
 
 const TOKEN_CACHE = new Map<string, { token: string; expiresAt: number }>();
 
-function parseSAFromApiKey(apiKey: string): ServiceAccount {
+export function parseSAFromApiKey(apiKey: string): ServiceAccount {
   try {
     return JSON.parse(apiKey);
   } catch {
@@ -21,7 +21,7 @@ function parseSAFromApiKey(apiKey: string): ServiceAccount {
   }
 }
 
-async function getAccessToken(sa: ServiceAccount): Promise<string> {
+export async function getAccessToken(sa: ServiceAccount): Promise<string> {
   if (!sa.client_email || !sa.private_key) {
     throw new Error(
       "Service Account JSON is missing required fields (client_email or private_key)"
@@ -87,16 +87,20 @@ const PARTNER_MODELS = new Set([
   "claude-3-haiku",
   "deepseek-v3",
   "deepseek-v3.2",
+  "deepseek-v4",
   "deepseek-deepseek-r1",
   "qwen3-next-80b",
+  "qwen3.6-",
   "llama-3.1",
   "mistral-",
   "glm-5",
+  "glm-5.1",
   "meta/llama",
 ]);
 
 function isPartnerModel(model: string) {
-  return [...PARTNER_MODELS].some((prefix) => model.startsWith(prefix));
+  const normalizedModel = model.toLowerCase();
+  return [...PARTNER_MODELS].some((prefix) => normalizedModel.startsWith(prefix));
 }
 
 export class VertexExecutor extends BaseExecutor {

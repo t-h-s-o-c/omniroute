@@ -7,8 +7,10 @@
 
 import { z } from "zod";
 import { NextResponse } from "next/server";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { getWebhook, updateWebhookRecord, deleteWebhook } from "@/lib/localDb";
 import { validateBody, isValidationFailure } from "@/shared/validation/helpers";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
 const updateWebhookSchema = z
   .object({
@@ -21,6 +23,9 @@ const updateWebhookSchema = z
   .passthrough();
 
 export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
+  const authError = await requireManagementAuth(_);
+  if (authError) return authError;
+
   try {
     const { id } = await params;
     const webhook = getWebhook(id);
@@ -29,11 +34,14 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     }
     return NextResponse.json({ webhook });
   } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
 }
 
 export async function PUT(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   try {
     const { id } = await params;
     const rawBody = await request.json();
@@ -48,11 +56,14 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     }
     return NextResponse.json({ webhook });
   } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
 }
 
 export async function DELETE(_: Request, { params }: { params: Promise<{ id: string }> }) {
+  const authError = await requireManagementAuth(_);
+  if (authError) return authError;
+
   try {
     const { id } = await params;
     const deleted = deleteWebhook(id);
@@ -61,6 +72,6 @@ export async function DELETE(_: Request, { params }: { params: Promise<{ id: str
     }
     return NextResponse.json({ success: true });
   } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
 }

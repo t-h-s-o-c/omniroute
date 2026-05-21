@@ -11,6 +11,9 @@
  */
 
 import { Memory } from "./types";
+import { logger } from "../../../open-sse/utils/logger.ts";
+
+const log = logger("MEMORY_INJECTION");
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -32,7 +35,16 @@ export interface ChatRequest {
  * Providers known NOT to support a top-level system-role message.
  * These receive memories injected as the first user message instead.
  */
-const PROVIDERS_WITHOUT_SYSTEM_MESSAGE = new Set(["o1", "o1-mini", "o1-preview"]);
+const PROVIDERS_WITHOUT_SYSTEM_MESSAGE = new Set([
+  "o1",
+  "o1-mini",
+  "o1-preview",
+  "glm", // GLM/ZhipuAI rejects system role (#1701)
+  "glmt", // GLM Thinking variant
+  "glm-cn", // GLM China variant
+  "zai", // Z.AI uses same GLM backend
+  "qianfan", // Baidu ERNIE rejects system role
+]);
 
 /**
  * Returns true when the given provider accepts a system-role message.
@@ -73,11 +85,15 @@ export function injectMemory(
   provider: string | null | undefined
 ): ChatRequest {
   if (!memories || memories.length === 0) {
+    log.info("memory.injection.skipped", { reason: "no_memories", model: request.model });
     return request;
   }
 
   const memoryText = formatMemoryContext(memories);
-  if (!memoryText) return request;
+  if (!memoryText) {
+    log.info("memory.injection.skipped", { reason: "empty_context", model: request.model });
+    return request;
+  }
 
   const messages: ChatMessage[] = Array.isArray(request.messages) ? [...request.messages] : [];
 
@@ -86,11 +102,21 @@ export function injectMemory(
     // Prepending before any existing system messages keeps memory context
     // accessible without overriding the caller's own system instructions.
     const memorySystemMessage: ChatMessage = { role: "system", content: memoryText };
+    log.info("memory.injection.injected", {
+      count: memories.length,
+      strategy: "system",
+      model: request.model,
+    });
     return { ...request, messages: [memorySystemMessage, ...messages] };
   } else {
     // Strategy 2 (fallback): inject as the first user message.
     // Used for providers like o1-mini that reject the system role.
     const memoryUserMessage: ChatMessage = { role: "user", content: memoryText };
+    log.info("memory.injection.injected", {
+      count: memories.length,
+      strategy: "user",
+      model: request.model,
+    });
     return { ...request, messages: [memoryUserMessage, ...messages] };
   }
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { useLocale } from "next-intl";
 import Card from "../Card";
 import { getModelColor } from "@/shared/constants/colors";
@@ -174,6 +174,8 @@ export function CompactStatGrid({ sections }: { sections: CompactStatSection[] }
 // ── ActivityHeatmap ────────────────────────────────────────────────────────
 
 export function ActivityHeatmap({ activityMap }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+
   const cells = useMemo(() => {
     const today = new Date();
     const days = [];
@@ -209,6 +211,12 @@ export function ActivityHeatmap({ activityMap }) {
     return w;
   }, [cells]);
 
+  // Auto-scroll to the right edge so the current date is visible
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollLeft = scrollRef.current.scrollWidth;
+    }
+  }, [weeks]);
   const monthLabels = useMemo(() => {
     const labels = [];
     let lastMonth = -1;
@@ -259,44 +267,48 @@ export function ActivityHeatmap({ activityMap }) {
         </span>
       </div>
 
-      <div className="flex gap-[3px] mb-1 ml-6" style={{ fontSize: "10px" }}>
-        {monthLabels.map((m, i) => (
-          <span
-            key={i}
-            className="text-text-muted"
-            style={{
-              position: "relative",
-              left: `${m.weekIdx * 13}px`,
-              marginLeft: i === 0 ? 0 : "-20px",
-            }}
-          >
-            {m.label}
-          </span>
-        ))}
-      </div>
-
-      <div className="flex gap-[3px] overflow-x-auto">
-        <div className="flex flex-col gap-[3px] shrink-0 text-[10px] text-text-muted pr-1">
-          <span className="h-[10px]"></span>
-          <span className="h-[10px] leading-[10px]">Mon</span>
-          <span className="h-[10px]"></span>
-          <span className="h-[10px] leading-[10px]">Wed</span>
-          <span className="h-[10px]"></span>
-          <span className="h-[10px] leading-[10px]">Fri</span>
-          <span className="h-[10px]"></span>
-        </div>
-
-        {weeks.map((week, wi) => (
-          <div key={wi} className="flex flex-col gap-[3px]">
-            {week.map((day, di) => (
-              <div
-                key={di}
-                title={day ? `${day.date}: ${fmtFull(day.value)} tokens` : ""}
-                className={`w-[10px] h-[10px] rounded-[2px] ${day ? getCellColor(day.value) : "bg-transparent"}`}
-              />
+      <div ref={scrollRef} className="overflow-x-auto">
+        <div className="w-max">
+          <div className="flex gap-[3px] mb-1 ml-6" style={{ fontSize: "10px" }}>
+            {monthLabels.map((m, i) => (
+              <span
+                key={i}
+                className="text-text-muted"
+                style={{
+                  position: "relative",
+                  left: `${m.weekIdx * 13}px`,
+                  marginLeft: i === 0 ? 0 : "-20px",
+                }}
+              >
+                {m.label}
+              </span>
             ))}
           </div>
-        ))}
+
+          <div className="flex gap-[3px]">
+            <div className="flex flex-col gap-[3px] shrink-0 text-[10px] text-text-muted pr-1 sticky left-0 z-10 bg-surface">
+              <span className="h-[10px]"></span>
+              <span className="h-[10px] leading-[10px]">Mon</span>
+              <span className="h-[10px]"></span>
+              <span className="h-[10px] leading-[10px]">Wed</span>
+              <span className="h-[10px]"></span>
+              <span className="h-[10px] leading-[10px]">Fri</span>
+              <span className="h-[10px]"></span>
+            </div>
+
+            {weeks.map((week, wi) => (
+              <div key={wi} className="flex flex-col gap-[3px]">
+                {week.map((day, di) => (
+                  <div
+                    key={di}
+                    title={day ? `${day.date}: ${fmtFull(day.value)} tokens` : ""}
+                    className={`w-[10px] h-[10px] rounded-[2px] ${day ? getCellColor(day.value) : "bg-transparent"}`}
+                  />
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
 
       <div className="flex items-center gap-1 mt-2 ml-6 text-[10px] text-text-muted">
@@ -349,7 +361,7 @@ export function DailyTrendChart({ dailyTrend }) {
         >
           <XAxis
             dataKey="date"
-            tick={{ fontSize: 9, fill: "var(--text-muted)" }}
+            tick={{ fontSize: 9, fill: "var(--color-text-muted)" }}
             axisLine={false}
             tickLine={false}
             interval={Math.max(Math.floor(chartData.length / 6), 0)}
@@ -769,7 +781,7 @@ export function WeeklyPattern({ weeklyPattern }) {
         <BarChart data={chartData} margin={{ top: 0, right: 0, left: 0, bottom: 0 }}>
           <XAxis
             dataKey="day"
-            tick={{ fontSize: 9, fill: "var(--text-muted)" }}
+            tick={{ fontSize: 9, fill: "var(--color-text-muted)" }}
             axisLine={false}
             tickLine={false}
           />
@@ -779,7 +791,7 @@ export function WeeklyPattern({ weeklyPattern }) {
           />
           <Bar
             dataKey="Tokens"
-            fill="var(--text-muted)"
+            fill="var(--color-text-muted)"
             opacity={0.3}
             radius={[3, 3, 0, 0]}
             animationDuration={400}
@@ -832,7 +844,7 @@ export function MostActiveDay7d({ activityMap }) {
     <Card className="p-4 flex flex-col justify-center" style={{ flex: 1, minHeight: 0 }}>
       <h3
         className="text-xs font-semibold uppercase tracking-wider mb-2"
-        style={{ color: "var(--text-muted)" }}
+        style={{ color: "var(--color-text-muted)" }}
       >
         Most Active Day
       </h3>
@@ -841,12 +853,12 @@ export function MostActiveDay7d({ activityMap }) {
           <span className="text-xl font-bold capitalize" style={{ lineHeight: 1.2 }}>
             {data.weekday}
           </span>
-          <span className="text-xs mt-1" style={{ color: "var(--text-muted)" }}>
+          <span className="text-xs mt-1" style={{ color: "var(--color-text-muted)" }}>
             {data.label} · {fmt(data.tokens)} tokens
           </span>
         </>
       ) : (
-        <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+        <span className="text-xs" style={{ color: "var(--color-text-muted)" }}>
           No data in the last 7 days
         </span>
       )}
@@ -898,7 +910,7 @@ export function WeeklySquares7d({ activityMap }) {
     <Card className="p-4 flex flex-col justify-center" style={{ flex: 1, minHeight: 0 }}>
       <h3
         className="text-xs font-semibold uppercase tracking-wider mb-3"
-        style={{ color: "var(--text-muted)" }}
+        style={{ color: "var(--color-text-muted)" }}
       >
         Weekly
       </h3>
@@ -923,7 +935,7 @@ export function WeeklySquares7d({ activityMap }) {
               style={{
                 fontSize: 9,
                 fontWeight: 600,
-                color: "var(--text-muted)",
+                color: "var(--color-text-muted)",
                 letterSpacing: "0.03em",
               }}
             >
@@ -1064,6 +1076,71 @@ export function ModelTable({ byModel, summary }) {
             ))}
           </tbody>
         </table>
+      </div>
+    </Card>
+  );
+}
+
+export function ServiceTierBreakdown({ byServiceTier, summary }) {
+  const data = useMemo(() => byServiceTier || [], [byServiceTier]);
+  const totalRequests = Number(summary?.totalRequests || 0);
+  const totalCost = Number(summary?.totalCost || 0);
+
+  if (!data.length) {
+    return null;
+  }
+
+  return (
+    <Card className="overflow-hidden">
+      <div className="p-4 border-b border-border flex items-center justify-between gap-3">
+        <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider">
+          Service Tier
+        </h3>
+        <span className="text-[11px] text-text-muted">Fast / Standard cost split</span>
+      </div>
+      <div className="divide-y divide-border">
+        {data.map((tier) => {
+          const isFast = tier.serviceTier === "priority";
+          const requestPct =
+            totalRequests > 0
+              ? ((Number(tier.requests || 0) / totalRequests) * 100).toFixed(1)
+              : "0";
+          const costPct =
+            totalCost > 0 ? ((Number(tier.cost || 0) / totalCost) * 100).toFixed(1) : "0";
+          return (
+            <div key={tier.serviceTier} className="p-4 flex flex-col gap-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`material-symbols-outlined text-[18px] ${
+                      isFast ? "text-sky-500" : "text-text-muted"
+                    }`}
+                  >
+                    {isFast ? "bolt" : "speed"}
+                  </span>
+                  <div>
+                    <div className="text-sm font-semibold text-text-main">{tier.label}</div>
+                    <div className="text-xs text-text-muted">
+                      {fmtFull(tier.requests)} requests · {fmt(tier.totalTokens)} tokens
+                    </div>
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="font-mono text-sm font-semibold text-amber-500">
+                    {fmtCost(tier.cost)}
+                  </div>
+                  <div className="text-xs text-text-muted">{costPct}% of cost</div>
+                </div>
+              </div>
+              <div className="h-1.5 rounded-full bg-black/5 dark:bg-white/10 overflow-hidden">
+                <div
+                  className={`h-full rounded-full ${isFast ? "bg-sky-500" : "bg-text-muted/50"}`}
+                  style={{ width: `${requestPct}%` }}
+                />
+              </div>
+            </div>
+          );
+        })}
       </div>
     </Card>
   );
@@ -1223,13 +1300,13 @@ export function ModelOverTimeChart({ dailyByModel, modelNames }) {
         <AreaChart data={chartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
           <XAxis
             dataKey="dateLabel"
-            tick={{ fontSize: 10, fill: "var(--text-muted)" }}
+            tick={{ fontSize: 10, fill: "var(--color-text-muted)" }}
             axisLine={false}
             tickLine={false}
             interval="preserveStartEnd"
           />
           <YAxis
-            tick={{ fontSize: 10, fill: "var(--text-muted)" }}
+            tick={{ fontSize: 10, fill: "var(--color-text-muted)" }}
             tickFormatter={(v) => fmt(v)}
             axisLine={false}
             tickLine={false}
