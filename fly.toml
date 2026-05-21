@@ -1,6 +1,6 @@
 # fly.toml app configuration file generated for omniroute-t1ugsa
 
-app = 'omniroute-t1ugsa'
+app = 'omniroute-thsoc'
 primary_region = 'sin'
 
 [build]
