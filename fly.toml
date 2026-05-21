@@ -12,6 +12,10 @@ primary_region = 'sin'
   HOST = '0.0.0.0'
   HOSTNAME = '0.0.0.0'
   TZ = 'Asia/Shanghai'
+  DATA_DIR = '/data'
+  INITIAL_PASSWORD = '28021986'
+  STORAGE_ENCRYPTION_KEY = '50eddf9ac157c450fdde1dc102ad821041df44be34337e810deaed7f0239a67c'
+  JWT_SECRET = 'DHQbaRAQNj3SjriD6g07x8AG2X6vMgk0lYHAOxTFmKbXQb7u40axpImLmdHFBPYU'
 
 [processes]
   app = 'node run-standalone.mjs'
